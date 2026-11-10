@@ -1,11 +1,10 @@
 import { memo, useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { CG } from '../engine/core.js';
 import type { RouteKey, Scene } from '../engine/core.js';
-import { BET_TIME, GameController, getClientSeed, getGraph, money, setClientSeed, setGraph, verifyRound, x2 } from '../game/controller';
-import type { Bot, GameEvent, HistoryEntry, MyBet, Round, Slot, SlotSettings, Snapshot, TopWin } from '../game/controller';
-import { r2, wallet } from '../game/wallet';
+import { GameController, money, r2, seedMatchesHash, x2 } from '../game/controller';
+import type { Bot, Fairness as FairData, GameEvent, HistoryEntry, MyBet, Slot, SlotSettings, Snapshot, TopWin } from '../game/controller';
+import { balanceStore } from '../game/balance';
 import { sound } from '../game/audio';
 
 const noSub = () => () => {};
@@ -28,7 +27,6 @@ export function GameView({ scene, toast, toastMsg, historyHost }: Props) {
   const [pops, setPops] = useState<Pop[]>([]);
   const [tab, setTab] = useState<'all' | 'mine' | 'top'>('all');
   const [modal, setModal] = useState<null | 'how' | 'fair'>(null);
-  const [graph, setGraphState] = useState(getGraph());
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const toastRef = useRef(toast); toastRef.current = toast;
   const popId = useRef(0);
@@ -53,7 +51,7 @@ export function GameView({ scene, toast, toastMsg, historyHost }: Props) {
 
   /* one controller per mounted game; created in an effect so StrictMode remounts stay clean */
   useEffect(() => {
-    const c = new GameController(scene, wallet, () => settings.current, (m) => toastRef.current(m), onEvent);
+    const c = new GameController(scene, () => settings.current, (m) => toastRef.current(m), onEvent);
     const cv = canvasRef.current as HTMLCanvasElement;
     c.attach(cv);
     const ro = new ResizeObserver(() => c.resize());
@@ -63,7 +61,7 @@ export function GameView({ scene, toast, toastMsg, historyHost }: Props) {
   }, [scene, onEvent]);
 
   const snap = useSyncExternalStore(ctrl ? ctrl.subscribe : noSub, ctrl ? ctrl.getSnapshot : noSnap);
-  const { balance } = useSyncExternalStore(wallet.subscribe, wallet.getSnapshot);
+  const { balance } = useSyncExternalStore(balanceStore.subscribe, balanceStore.getSnapshot);
   useEffect(() => { if (snap && snap.phase === 'running') sound.updateHum(snap.m); }, [snap]);
 
   useEffect(() => {
@@ -77,9 +75,8 @@ export function GameView({ scene, toast, toastMsg, historyHost }: Props) {
     return () => document.removeEventListener('keydown', onKey);
   }, [ctrl, modal]);
 
-  const progress = snap && snap.phase === 'betting' ? snap.countdown / BET_TIME : 0;
+  const progress = snap && snap.phase === 'betting' && snap.betTime > 0 ? snap.countdown / snap.betTime : 0;
   const multState = !snap || snap.phase === 'betting' ? 'idle' : snap.phase === 'crashed' ? 'crashed' : snap.m >= 10 ? 'hot' : snap.m >= 2 ? 'warm' : 'run';
-  const resetCredits = () => { wallet.reset(); toast('Demo credits reset to 1,000.00'); };
 
   return (
     <main className="layout" onPointerDown={() => sound.unlock()}>
@@ -97,8 +94,8 @@ export function GameView({ scene, toast, toastMsg, historyHost }: Props) {
           {snap && tab === 'top' && <TopWins wins={snap.topWins} />}
         </div>
         <div className="side-foot">
-          <span>Demo credits, no real money</span>
-          <button type="button" className={'refill' + (balance < 1 ? ' low' : '')} onClick={resetCredits}>Reset</button>
+          <span>{snap?.connection === 'online' ? 'Live on the game server' : snap?.connection === 'offline' ? 'Game server offline' : 'Connecting…'}</span>
+          <button type="button" className="refill" onClick={() => ctrl?.refreshBalance()}>Refresh</button>
         </div>
       </aside>
 
@@ -111,15 +108,12 @@ export function GameView({ scene, toast, toastMsg, historyHost }: Props) {
                 <div className="tag"><b>Round {snap.round.nonce.toLocaleString('en-US')}</b> · {snap.hud.label}</div>
                 <div className="mult" data-state={multState}>{snap.hud.mult}</div>
                 <div className="status">{snap.hud.sub}</div>
-                {snap.phase === 'betting' && <div className="bar"><i style={{ transform: `scaleX(${progress})` }} /></div>}
+                {snap.phase === 'betting' && snap.round.id > 0 && <div className="bar"><i style={{ transform: `scaleX(${progress})` }} /></div>}
               </div>
               <div className="corner">
                 <SoundChip />
                 <button type="button" className="chip" aria-label="How to play" onClick={() => setModal('how')}><InfoIcon /><span className="lbl">How to play</span></button>
                 <button type="button" className="chip chip-fair" aria-label="Provably fair" onClick={() => setModal('fair')}><ShieldIcon /><span className="lbl">Provably fair</span></button>
-                {scene.graph !== false && (
-                  <button type="button" className={'chip' + (graph ? ' on' : '')} aria-pressed={graph} aria-label="Multiplier curve" onClick={() => { setGraph(!graph); setGraphState(!graph); }}><ChartIcon /><span className="lbl">Curve</span></button>
-                )}
                 <div className="chip">Racers <b>{snap.players}</b></div>
               </div>
               <div className="pops">
@@ -147,14 +141,14 @@ export function GameView({ scene, toast, toastMsg, historyHost }: Props) {
         <div className="slots">
           {[0, 1].map((i) => (
             <BetSlot key={i} index={i} set={slotSet[i]} slot={snap ? snap.slots[i] : null} phase={snap ? snap.phase : 'betting'} m={snap ? snap.m : 1}
-              balance={balance} onChange={(p) => updateSlot(i, p)} onAction={() => { sound.unlock(); ctrl?.action(i); }} />
+              balance={balance} online={snap?.connection === 'online' && snap.round.id > 0} limits={snap ? [snap.minBet, snap.maxBet] : [1, 10000]} onChange={(p) => updateSlot(i, p)} onAction={() => { sound.unlock(); ctrl?.action(i); }} />
           ))}
         </div>
       </section>
 
       {modal && (
         <Modal title={modal === 'how' ? 'How to play ' + scene.name : 'Provably fair'} onClose={() => setModal(null)}>
-          {modal === 'how' ? <HowTo scene={scene} /> : snap ? <Fairness scene={scene} round={snap.round} prev={snap.prev} toast={toast} /> : null}
+          {modal === 'how' ? <HowTo scene={scene} /> : snap ? <Fairness round={snap.round} data={snap.fairness} toast={toast} /> : null}
         </Modal>
       )}
     </main>
@@ -164,7 +158,6 @@ export function GameView({ scene, toast, toastMsg, historyHost }: Props) {
 /* ---------- icons ---------- */
 function ShieldIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3Zm-1.2 14.2-3.5-3.5 1.4-1.4 2.1 2.1 4.9-4.9 1.4 1.4-6.3 6.3Z" /></svg>; }
 function InfoIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm1 15h-2v-6h2v6Zm0-8h-2V7h2v2Z" /></svg>; }
-function ChartIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" d="M3 20h18M4 17c6 0 10-4 15-13" /></svg>; }
 
 function SoundChip() {
   const muted = useSyncExternalStore(sound.subscribe, sound.getSnapshot);
@@ -211,24 +204,25 @@ function HowTo({ scene }: { scene: Scene }) {
         <div><span>Rounds that bust at 1.00×</span><b>3%</b></div>
       </div>
       <p className="note">Turn on <b>Auto bet</b> to bet every round, or <b>Auto cash out</b> to collect at a set multiplier. Space bar bets or cashes out on Bet A.</p>
-      <p className="note">Demo credits have no cash value and can't be bought or withdrawn. Every game returns 97% of stakes over the long run, so expect to lose about 3% of what you bet.</p>
+      <p className="note">Rounds, bets, cash-outs and your balance all run on the game server. It returns 97% of stakes over the long run, so expect to lose about 3% of what you bet. The other players in the bets list are only for show.</p>
     </div>
   );
 }
 
 /* ---------- bet slot ---------- */
-function BetSlot({ index, set, slot, phase, m, balance, onChange, onAction }: {
-  index: number; set: SlotSettings; slot: Slot | null; phase: string; m: number; balance: number;
+function BetSlot({ index, set, slot, phase, m, balance, online, limits, onChange, onAction }: {
+  index: number; set: SlotSettings; slot: Slot | null; phase: string; m: number; balance: number | null; online: boolean; limits: [number, number];
   onChange: (p: Partial<SlotSettings>) => void; onAction: () => void;
 }) {
   const name = 'Bet ' + SLOT_NAME[index];
   const [betText, setBetText] = useState(set.bet.toFixed(2));
   const [autoText, setAutoText] = useState(set.autoAt.toFixed(2));
   useEffect(() => { setBetText(set.bet.toFixed(2)); }, [set.bet]);
-  const commitBet = (v: number) => { const n = Math.max(1, r2(v || 0)); setBetText(n.toFixed(2)); onChange({ bet: n }); };
+  const commitBet = (v: number) => { const n = Math.min(limits[1], Math.max(limits[0], r2(v || 0))); setBetText(n.toFixed(2)); onChange({ bet: n }); };
   const s = slot ? slot.status : 'none';
   let label: string, sub: string, mode: string;
-  if (phase === 'betting' && s === 'none') { mode = 'bet'; label = 'Place bet'; sub = money(set.bet) + ' credits'; }
+  if (!online) { mode = 'next'; label = 'Connecting'; sub = 'Waiting for the game server'; }
+  else if (phase === 'betting' && s === 'none') { mode = 'bet'; label = 'Place bet'; sub = money(set.bet) + ' credits'; }
   else if (phase === 'betting' && s === 'placed' && slot) { mode = 'cancel'; label = 'Cancel'; sub = money(slot.amount) + ' on this round'; }
   else if (phase === 'running' && s === 'active' && slot) { mode = 'cash'; label = 'Cash out'; sub = money(r2(slot.amount * m)) + ' at ' + x2(m); }
   else if (slot?.queued) { mode = 'queued'; label = 'Cancel'; sub = money(set.bet) + ' waiting for next round'; }
@@ -236,7 +230,7 @@ function BetSlot({ index, set, slot, phase, m, balance, onChange, onAction }: {
     mode = 'next'; label = 'Bet next round';
     sub = s === 'cashed' && slot ? 'Won ' + money(slot.pay as number) + ' at ' + x2(slot.at as number) : s === 'lost' && slot ? 'Lost ' + money(slot.amount) : money(set.bet) + ' credits';
   }
-  const locked = s === 'placed' || s === 'active';
+  const locked = s === 'placed' || s === 'active' || !!slot?.busy;
   return (
     <div className={'slot' + (s === 'active' ? ' live' : '')}>
       <div className="slot-head">
@@ -268,10 +262,10 @@ function BetSlot({ index, set, slot, phase, m, balance, onChange, onAction }: {
             <button type="button" className="step" aria-label={'Raise ' + name} disabled={locked} onClick={() => commitBet(set.bet + (set.bet >= 10 ? 5 : 1))}>+</button>
           </div>
           <div className="quick">
-            {[10, 50, 100, 500].map((v) => <button key={v} type="button" disabled={locked} onClick={() => commitBet(Math.min(v, Math.max(1, Math.floor(balance))))}>{v}</button>)}
+            {[10, 50, 100, 500].map((v) => <button key={v} type="button" disabled={locked} onClick={() => commitBet(balance == null ? v : Math.min(v, Math.max(limits[0], Math.floor(balance))))}>{v}</button>)}
           </div>
         </div>
-        <button type="button" className="action" data-mode={mode} onClick={onAction}>
+        <button type="button" className="action" data-mode={mode} disabled={!online || !!slot?.busy} aria-busy={!!slot?.busy} onClick={onAction}>
           <span>{label}</span>
           <small>{sub}</small>
         </button>
@@ -331,7 +325,7 @@ function MyBets({ bets }: { bets: MyBet[] }) {
       <ListHead first="Round" />
       {bets.map((b) => (
         <li key={b.id} className={b.at ? 'won' : 'lost'}>
-          <span className="who"><span className="nm">{'#' + b.round.toLocaleString('en-US') + ' · ' + SLOT_NAME[b.slot - 1]}</span></span>
+          <span className="who"><span className="nm">{'#' + b.round.toLocaleString('en-US') + ' · ' + SLOT_NAME[b.slot]}</span></span>
           <span className="bet">{money(b.amount)}</span>
           <span className="at">{b.at ? x2(b.at) : '–'}</span>
           <span className="win">{b.at ? '+' + money(b.pay) : '−' + money(b.amount)}</span>
@@ -362,49 +356,37 @@ function TopWins({ wins }: { wins: TopWin[] }) {
 }
 
 /* ---------- fairness ---------- */
-const Fairness = memo(function Fairness({ scene, round, prev, toast }: { scene: Scene; round: Snapshot['round']; prev: Round | null; toast: (m: string) => void }) {
-  const [seed, setSeed] = useState(getClientSeed());
+const Fairness = memo(function Fairness({ round, data, toast }: { round: Snapshot['round']; data: FairData; toast: (m: string) => void }) {
   const [verdict, setVerdict] = useState<{ ok: boolean; text: string } | null>(null);
-  useEffect(() => { setVerdict(null); }, [prev]);
-  const applySeed = (v: string) => { const s = v.trim().slice(0, 64); if (!s) { setSeed(getClientSeed()); return; } setClientSeed(s); setSeed(s); toast('Your new client seed applies from the next round.'); };
+  useEffect(() => { setVerdict(null); }, [data.previous]);
   const copy = () => {
-    const h = round.hash || '';
-    try { navigator.clipboard.writeText(h).then(() => toast('Hash copied'), () => toast('Copy was blocked. Select the hash and copy it yourself.')); }
+    try { navigator.clipboard.writeText(data.hash).then(() => toast('Hash copied'), () => toast('Copy was blocked. Select the hash and copy it yourself.')); }
     catch { toast('Copy was blocked. Select the hash and copy it yourself.'); }
   };
-  const o = prev?.out, R = scene.routes;
-  const outText = !o ? '' : scene.dual && R ? R.L.name + ' ' + x2(o.L as number) + ', ' + R.R.name + ' ' + x2(o.R as number)
-    : scene.fork && R ? ((o.trunk as number) < scene.fork ? 'Shared track ' + x2(o.trunk as number) + ' (before the split)' : R.L.name + ' ' + x2(o.L as number) + ', ' + R.R.name + ' ' + x2(o.R as number))
-      : x2(o.trunk as number);
   return (
     <div className="fair">
-      <p className="note">Every result is fixed before betting opens. You see a hash of the secret server seed now, and the seed itself after the round, so you can check nothing changed.</p>
+      <p className="note">The game server draws every crash point before betting opens, from a secret server seed and the round number. You see a hash of that seed now. When the server changes seeds it reveals the old one, so you can check it matches the hash it showed you.</p>
       <dl>
-        <dt>Round #{round.nonce} · server seed hash <button type="button" className="link" onClick={copy}>Copy</button></dt>
-        <dd className="mono code">{round.hash || 'Generating…'}</dd>
-        <dt><label htmlFor="clientSeed">Your client seed</label></dt>
-        <dd className="seed-row">
-          <input id="clientSeed" className="mono" value={seed} onChange={(e) => setSeed(e.target.value)} onBlur={(e) => applySeed(e.target.value)} />
-          <button type="button" onClick={() => applySeed(CG.fair.randomSeed(8))}>New</button>
-        </dd>
+        <dt>Round {round.id || '–'} · nonce {round.nonce || '–'} · server seed hash <button type="button" className="link" onClick={copy}>Copy</button></dt>
+        <dd className="mono code">{data.hash || 'Connecting…'}</dd>
       </dl>
-      {prev ? (
+      {data.previous ? (
         <div className="prev">
-          <h3>Previous round #{prev.nonce}</h3>
+          <h3>Previous server seed</h3>
           <dl>
-            <dt>Revealed server seed</dt><dd className="mono code">{prev.seed}</dd>
-            <dt>Client seed</dt><dd className="mono code">{prev.client}</dd>
-            <dt>Result</dt><dd>{outText}</dd>
+            <dt>Revealed seed</dt><dd className="mono code">{data.previous.seed}</dd>
+            <dt>Published hash</dt><dd className="mono code">{data.previous.hash}</dd>
           </dl>
           <button type="button" className="verify-btn" onClick={async () => {
+            const prev = data.previous!;
             setVerdict({ ok: true, text: 'Checking…' });
-            const ok = await verifyRound(scene, prev);
-            setVerdict({ ok, text: ok ? 'Verified. The seed matches the published hash and every result recomputes exactly.' : 'Mismatch. These results do not match the published hash.' });
-          }}><ShieldIcon /> Verify previous round</button>
+            const ok = await seedMatchesHash(prev.seed, prev.hash);
+            setVerdict({ ok, text: ok ? 'Verified. The revealed seed matches the hash that was published before its rounds.' : 'Mismatch. The revealed seed does not match its hash.' });
+          }}><ShieldIcon /> Verify previous seed</button>
           {verdict && <p className={'verdict ' + (verdict.ok ? 'pos' : 'neg')}>{verdict.text}</p>}
         </div>
-      ) : <p className="note">Play one round and its revealed seed appears here to check.</p>}
-      <p className="note small">Formula: r = HMAC-SHA256(server seed, client seed:nonce:path), crash = floor(97 / (1 − r)) / 100, so P(crash ≥ x) = 0.97 / x. For this demo the seeds are made in your browser; a live product keeps them on its server.</p>
+      ) : <p className="note">No seed has been revealed yet. The server reveals one each time it changes seeds.</p>}
+      <p className="note small">Crash points use a 3% house edge and a 10,000× cap, so P(crash ≥ x) = 0.97 / x.</p>
     </div>
   );
 });

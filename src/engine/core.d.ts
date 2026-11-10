@@ -49,23 +49,9 @@ export interface Scene {
   draw: (ctx: CanvasRenderingContext2D, w: number, h: number, S: SceneState, st: unknown) => void;
 }
 
-export interface Outcome { trunk: number | null; L?: number | null; R?: number | null; }
-
-export interface Fair {
-  EDGE: number;
-  MAX: number;
-  randomSeed(bytes?: number): string;
-  sha256(str: string): Promise<string>;
-  float(seed: string, msg: string): Promise<number>;
-  crashFrom(r: number): number;
-  routeFrom(r: number, fork: number): number;
-  outcome(game: Scene, seed: string, client: string, nonce: number): Promise<Outcome>;
-}
-
 export const CG: {
   scenes: Scene[];
   register: (s: Scene) => void;
   K: number;
-  fair: Fair;
   U: Record<string, any>;
 };

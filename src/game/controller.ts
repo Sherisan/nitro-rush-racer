@@ -1,26 +1,31 @@
-/* Round controller: one instance per open game. Runs the round lifecycle, settles two
-   independent bet slots, drives the simulated players, draws the scene with camera and
-   post effects, and emits events for sound and on-screen popups.
+/* Round controller: one instance per open game.
+   The GameEngineAPI runs the rounds. It draws every crash point before betting opens, runs the
+   clock, takes the bets, pays the cash-outs and keeps the wallet. This class follows its rounds over
+   SignalR (/livecrashhub), animates the multiplier between server ticks, draws the scene and sends
+   the player's bets, cancels and cash-outs to the server.
+   The other players in the bets list and the route picker are only for show.
    React reads it through subscribe/getSnapshot (useSyncExternalStore). */
 import { CG } from '../engine/core.js';
-import type { Outcome, Phase, RouteKey, Scene, SceneState, DualLane } from '../engine/core.js';
-import { r2, type Wallet } from './wallet';
+import type { Phase, RouteKey, Scene, SceneState } from '../engine/core.js';
+import { LiveCrashClient } from '../api/liveCrash';
+import type { LiveConfig, LiveRound, LiveSnapshot, MyBet as ServerBet } from '../api/liveCrash';
+import { balanceStore } from './balance';
 
-export const BET_TIME = 6;
-export const END_TIME = 4;
 export const VH = 540;
 
 export const x2 = (m: number) => m.toFixed(2) + '×';
 export const money = (v: number) => v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+export const r2 = (v: number) => Math.floor(v * 100 + 1e-7) / 100;
 
 export type SlotStatus = 'none' | 'placed' | 'active' | 'cashed' | 'lost';
-export interface Slot { status: SlotStatus; amount: number; at?: number; pay?: number; queued: boolean; }
+export interface Slot { status: SlotStatus; amount: number; at?: number; pay?: number; queued: boolean; busy: boolean; }
 export interface SlotSettings { bet: number; autoOn: boolean; autoAt: number; autoBet: boolean; }
 export interface Bot { name: string; bet: number; target: number; route: RouteKey; status: 'in' | 'cashed' | 'lost'; at: number; when?: number; }
 export interface TopWin { name: string; bet: number; at: number; win: number; round: number; you: boolean; }
-export interface Round { nonce: number; seed: string; client: string; hash: string | null; out: Outcome | null; ready: boolean; }
 export interface HistoryEntry { v: number; dot: string | null; detail: string; }
-export interface MyBet { id: number; game: string; round: number; slot: number; amount: number; at: number | null; pay: number; result: number; time: number; }
+export interface MyBet { id: string; round: number; slot: number; amount: number; at: number | null; pay: number; }
+export type Connection = 'connecting' | 'online' | 'reconnecting' | 'offline';
+export interface Fairness { hash: string; previous: { seed: string; hash: string } | null; }
 
 export type GameEvent =
   | { type: 'tick'; last: boolean }
@@ -35,75 +40,65 @@ export interface Snapshot {
   phase: Phase;
   m: number;
   countdown: number;
+  betTime: number;
   route: RouteKey;
   routeLocked: boolean;
-  forkPassed: boolean;
   slots: [Slot, Slot];
   bots: Bot[];
   history: HistoryEntry[];
-  round: { nonce: number; hash: string | null; client: string };
-  prev: Round | null;
+  round: { id: number; nonce: number };
+  fairness: Fairness;
   myBets: MyBet[];
   topWins: TopWin[];
   hud: { label: string; mult: string; sub: string };
   players: number;
   wagered: number;
+  connection: Connection;
+  minBet: number;
+  maxBet: number;
 }
 
 const NAMES = ['Thabo', 'Lerato', 'Sipho', 'Naledi', 'Mpho', 'Ayanda', 'Zola', 'Kagiso', 'Lindiwe', 'Tumi', 'Bongani', 'Nomsa', 'Jabu', 'Refilwe', 'Kabelo', 'Zanele', 'Dineo', 'Themba', 'Pieter', 'Annika', 'Ravi', 'Priya', 'Marco', 'Chen', 'Yusuf', 'Amara', 'Kofi', 'Elena', 'Tariq', 'Mei', 'Lwazi', 'Karabo', 'Nandi', 'Sizwe'];
 const MILESTONES = [2, 5, 10, 25, 50, 100];
+const SLOT_NAMES = ['A', 'B'];
 
-/* session state shared across games */
+/* session lists shared across games */
 const histories: Record<string, HistoryEntry[]> = {};
 const topWins: Record<string, TopWin[]> = {};
 let myBets: MyBet[] = [];
-let betId = 0;
 
-function readSeed(): string {
-  try { const v = localStorage.getItem('cg.client'); if (v) return JSON.parse(v); } catch { /* ignore */ }
-  const s = CG.fair.randomSeed(8);
-  try { localStorage.setItem('cg.client', JSON.stringify(s)); } catch { /* ignore */ }
-  return s;
-}
-let clientSeed = readSeed();
-let nonce = (() => { try { return Number(JSON.parse(localStorage.getItem('cg.nonce') || '0')) || 0; } catch { return 0; } })();
-
-export function getClientSeed() { return clientSeed; }
-export function setClientSeed(v: string) {
-  clientSeed = v;
-  try { localStorage.setItem('cg.client', JSON.stringify(v)); } catch { /* ignore */ }
-}
 export function getHistory(id: string) { return histories[id] || []; }
-let showGraph = (() => { try { return localStorage.getItem('cg.graph') !== '0'; } catch { return true; } })();
-export function getGraph() { return showGraph; }
-export function setGraph(v: boolean) { showGraph = v; try { localStorage.setItem('cg.graph', v ? '1' : '0'); } catch { /* ignore */ } }
 
-const emptySlot = (queued = false): Slot => ({ status: 'none', amount: 0, queued });
+const emptySlot = (queued = false): Slot => ({ status: 'none', amount: 0, queued, busy: false });
+const errorText = (e: unknown, fallback: string) => (e instanceof Error && e.message ? e.message : fallback);
 
 export class GameController {
   readonly scene: Scene;
-  private wallet: Wallet;
   private settings: () => [SlotSettings, SlotSettings];
   private toast: (msg: string) => void;
   private onEvent: (e: GameEvent) => void;
+  private client: LiveCrashClient;
+
+  private cfg: LiveConfig | null = null;
+  private growth = CG.K;
+  private betTime = 6;
+  private round: LiveRound | null = null;
+  private connection: Connection = 'connecting';
+  private fairness: Fairness = { hash: '', previous: null };
 
   private phase: Phase = 'betting';
-  private phaseStart = 0;
+  private betEnd = 0;
   private runStart = 0;
   private crashTime = 0;
   private m = 1;
   private t = 0;
-  private countdown = BET_TIME;
+  private countdown = 0;
   private lastTick = -1;
   private nextMilestone = 0;
   private route: RouteKey = 'L';
-  private forkPassed = false;
-  private round!: Round;
-  private prev: Round | null = null;
   private slots: [Slot, Slot] = [emptySlot(), emptySlot()];
   private bots: Bot[] = [];
   private cashAt: number | null = null;
-  private dual: Record<RouteKey, DualLane> | null = null;
   private st: unknown = null;
   private punch = 0;
 
@@ -117,11 +112,31 @@ export class GameController {
   private listeners = new Set<() => void>();
   private disposed = false;
 
-  constructor(scene: Scene, wallet: Wallet, settings: () => [SlotSettings, SlotSettings], toast: (msg: string) => void, onEvent: (e: GameEvent) => void) {
-    this.scene = scene; this.wallet = wallet; this.settings = settings; this.toast = toast; this.onEvent = onEvent;
+  constructor(scene: Scene, settings: () => [SlotSettings, SlotSettings], toast: (msg: string) => void, onEvent: (e: GameEvent) => void) {
+    this.scene = scene; this.settings = settings; this.toast = toast; this.onEvent = onEvent;
     histories[scene.id] = histories[scene.id] || [];
     topWins[scene.id] = topWins[scene.id] || [];
-    this.newRound();
+    this.st = scene.init(this.VW, VH);
+    this.emit();
+    this.client = new LiveCrashClient(scene.id);
+    this.client.handlers = {
+      round: (r) => this.onRound(r),
+      tick: (m, serverMs) => this.onTick(m, serverMs),
+      myBet: (b, bal) => this.onMyBet(b, bal),
+      resync: (s) => this.applySnapshot(s),
+      status: (s, msg) => {
+        if (this.disposed) return;
+        this.connection = s;
+        if (msg && s !== 'online') this.toast(msg);
+        this.emit();
+      },
+    };
+    this.client.connect().then((s) => this.applySnapshot(s)).catch((e) => {
+      if (this.disposed) return;
+      this.connection = 'offline';
+      this.toast(errorText(e, "Can't reach the game server."));
+      this.emit();
+    });
   }
 
   /* ---------- React store ---------- */
@@ -144,36 +159,82 @@ export class GameController {
     this.scale = this.canvas.height / VH; this.VW = this.canvas.width / this.scale;
     if (this.phase === 'betting') this.st = this.scene.init(this.VW, VH);
   }
-  /** Leaving the game: open bets are cashed out at the current multiplier, pending ones refunded. */
+  /** Leaving the game. Bets stay on the server: auto cash-outs still pay, the rest settle with the round. */
   dispose() {
     if (this.disposed) return;
-    this.slots.forEach((s, i) => {
-      if (s.status === 'active' && this.phase === 'running') this.cashOut(i, r2(this.m), true);
-      else if (s.status === 'placed') this.wallet.refund(s.amount);
-    });
     this.disposed = true; cancelAnimationFrame(this.raf); this.listeners.clear();
+    void this.client.disconnect();
   }
 
-  /* ---------- outcomes ---------- */
-  private crashFor(route: RouteKey): number {
-    const o = this.round.out!, sc = this.scene;
-    if (sc.dual) return o[route] as number;
-    if (!sc.fork) return o.trunk as number;
-    return (o.trunk as number) < sc.fork ? (o.trunk as number) : (o[route] as number);
-  }
-  private endPoint(): number {
-    const o = this.round.out!;
-    if (this.scene.dual) return Math.max(o.L as number, o.R as number);
-    return this.crashFor(this.route);
-  }
-  isRouteLocked(): boolean {
-    const sc = this.scene;
-    if (!sc.routes) return true;
-    if (sc.dual) return this.phase !== 'betting';
-    return this.phase === 'crashed' || this.forkPassed;
+  /* ---------- server state ---------- */
+  private applySnapshot(s: LiveSnapshot) {
+    if (this.disposed) return;
+    this.cfg = s.config;
+    this.growth = s.config.growthRate || CG.K;
+    this.betTime = s.config.bettingMs / 1000;
+    balanceStore.set(s.balance, s.player.currency);
+    histories[this.scene.id] = s.state.history.map((h) => ({ v: h.crashPoint, dot: null, detail: 'Round ' + h.roundId + ' crashed at ' + x2(h.crashPoint) }));
+    const prev = s.state.fairness.previousServerSeed;
+    this.fairness = { hash: s.state.fairness.currentServerSeedHash, previous: prev && prev.serverSeed && prev.hash ? { seed: prev.serverSeed, hash: prev.hash } : null };
+    const r = s.state.round;
+    this.round = null;
+    this.onRound(r, true);
+    if (r.status === 'FLYING' && s.state.multiplier) this.onTick(s.state.multiplier, s.state.serverTime);
+    this.slots = [0, 1].map((i) => {
+      const b = s.state.myBets.find((x) => x.roundId === r.id && x.slot === i);
+      return b ? this.slotFromServer(b, this.slots[i]) : emptySlot(this.slots[i].queued);
+    }) as [Slot, Slot];
+    this.emit();
   }
 
-  /* ---------- round lifecycle ---------- */
+  private slotFromServer(b: ServerBet, old: Slot): Slot {
+    const base = { amount: b.amount, queued: false, busy: false };
+    switch (b.status) {
+      case 'Pending': return { ...base, status: 'placed' };
+      /* the server calls a bet Active as soon as it is in the round, before launch too */
+      case 'Active': return { ...base, status: this.phase === 'running' ? 'active' : 'placed' };
+      case 'CashedOut': return { ...base, status: 'cashed', at: b.cashedOutAt ?? undefined, pay: b.win ?? 0 };
+      case 'Lost': return { ...base, status: 'lost' };
+      default: return emptySlot(old.queued);
+    }
+  }
+
+  private onRound(r: LiveRound, restore = false) {
+    if (this.disposed) return;
+    const prev = this.round;
+    this.round = r;
+    if (r.serverSeedHash) this.fairness = { ...this.fairness, hash: r.serverSeedHash };
+    if (r.status === 'BETTING') {
+      this.betEnd = this.client.toLocal(r.phaseEndsAt) / 1000;
+      if (!prev || prev.id !== r.id || this.phase !== 'betting') this.newRound(restore);
+    } else if (r.status === 'FLYING') {
+      this.runStart = this.client.toLocal(r.startedAt) / 1000;
+      if (this.phase !== 'running') this.startRun(restore);
+    } else if (r.status === 'CRASHED') {
+      if (this.phase !== 'crashed') this.finishRound(r, restore);
+    }
+    this.emit();
+  }
+
+  private onTick(m: number, serverMs: number) {
+    if (this.disposed || this.phase !== 'running') return;
+    this.runStart = this.client.toLocal(serverMs) / 1000 - Math.log(Math.max(1, m)) / this.growth;
+  }
+
+  private onMyBet(b: ServerBet, bal: number | null) {
+    if (this.disposed) return;
+    balanceStore.set(bal);
+    if (!this.round || b.roundId !== this.round.id || b.slot < 0 || b.slot > 1) return;
+    const i = b.slot, s = this.slots[i];
+    if (b.status === 'CashedOut') this.markCashed(i, b.amount, b.cashedOutAt ?? this.m, b.win ?? 0, b.winPending);
+    else if (b.status === 'Lost' && s.status !== 'lost') { this.slots[i] = { ...s, status: 'lost', amount: b.amount, busy: false }; this.logBet(i, b.amount, null, 0); }
+    else if (b.status === 'Cancelled') this.slots[i] = emptySlot(s.queued);
+    else if (b.status === 'Pending' && s.status !== 'placed') this.slots[i] = { ...s, status: 'placed', amount: b.amount, busy: false };
+    else if (b.status === 'Active') this.slots[i] = { ...s, status: this.phase === 'running' ? 'active' : 'placed', amount: b.amount, busy: false };
+    this.emit();
+  }
+
+  /* ---------- round lifecycle (following the server) ---------- */
   private makeBots(): Bot[] {
     const n = 9 + Math.floor(Math.random() * 10), pool = NAMES.slice().sort(() => Math.random() - 0.5), bets = [5, 10, 10, 20, 25, 50, 50, 100, 200, 250, 500, 1000];
     return pool.slice(0, n).map((name) => {
@@ -183,37 +244,129 @@ export class GameController {
     });
   }
 
-  private async newRound() {
-    const sc = this.scene;
-    this.phase = 'betting'; this.phaseStart = performance.now() / 1000; this.st = sc.init(this.VW, VH);
-    this.cashAt = null; this.forkPassed = false; this.m = 1; this.t = 0; this.countdown = BET_TIME; this.lastTick = -1; this.nextMilestone = 0;
-    this.dual = sc.dual ? { L: { m: 1, dead: false, age: 0 }, R: { m: 1, dead: false, age: 0 } } : null;
-    nonce++;
-    try { localStorage.setItem('cg.nonce', JSON.stringify(nonce)); } catch { /* ignore */ }
-    const r: Round = { nonce, seed: CG.fair.randomSeed(), client: clientSeed, hash: null, out: null, ready: false };
-    this.round = r;
+  private newRound(restore: boolean) {
+    this.phase = 'betting'; this.st = this.scene.init(this.VW, VH);
+    this.cashAt = null; this.m = 1; this.t = 0; this.lastTick = -1; this.nextMilestone = 0;
     const queued = this.slots.map((s) => s.queued);
     this.slots = [emptySlot(), emptySlot()];
     this.bots = this.makeBots();
+    if (restore) return;
     const set = this.settings();
     queued.forEach((q, i) => {
-      if (!q && !set[i].autoBet) return;
-      if (!this.placeBet(i, set[i].autoBet && !q) && set[i].autoBet) this.onEvent({ type: 'autostop', slot: i });
+      if (q || set[i].autoBet) void this.placeBet(i, set[i].autoBet && !q);
     });
-    this.emit();
-    try {
-      r.hash = await CG.fair.sha256(r.seed);
-      r.out = await CG.fair.outcome(sc, r.seed, r.client, r.nonce);
-      r.ready = true;
-    } catch {
-      this.toast('This browser blocked the secure random functions the game needs.');
-    }
   }
 
-  private startRun() {
-    this.phase = 'running'; this.runStart = performance.now() / 1000;
+  private startRun(restore: boolean) {
+    this.phase = 'running';
     this.slots = this.slots.map((s) => (s.status === 'placed' ? { ...s, status: 'active' as const } : s)) as [Slot, Slot];
-    this.onEvent({ type: 'launch' });
+    if (!restore) this.onEvent({ type: 'launch' });
+  }
+
+  private finishRound(r: LiveRound, restore: boolean) {
+    const end = r.crashPoint ?? this.m;
+    this.phase = 'crashed'; this.crashTime = performance.now() / 1000; this.m = end;
+    if (!restore) this.punch = 1;
+    /* the server confirms each lost bet with MyBet; show it straight away */
+    this.slots = this.slots.map((s, i) => {
+      if (s.status !== 'active') return s;
+      this.logBet(i, s.amount, null, 0);
+      return { ...s, status: 'lost' as const, busy: false };
+    }) as [Slot, Slot];
+    this.bots = this.bots.map((b) => (b.status !== 'in' ? b : b.target <= end ? { ...b, status: 'cashed' as const, at: b.target } : { ...b, status: 'lost' as const }));
+    const h = histories[this.scene.id];
+    if (r.crashPoint != null && !h.some((x) => x.detail.startsWith('Round ' + r.id + ' '))) {
+      histories[this.scene.id] = [{ v: end, dot: null, detail: 'Round ' + r.id + ' crashed at ' + x2(end) }, ...h].slice(0, 40);
+    }
+    if (!restore) this.onEvent({ type: 'crash', m: end });
+  }
+
+  /* ---------- player actions (sent to the server) ---------- */
+  setRoute(k: RouteKey) { if (!this.isRouteLocked()) { this.route = k; this.emit(); } }
+  isRouteLocked() { return !this.scene.routes || this.phase !== 'betting'; }
+
+  /** Fetches the balance from the server again. */
+  async refreshBalance() {
+    try { balanceStore.set(await this.client.getBalance()); this.toast('Balance updated from the game server.'); }
+    catch (e) { this.toast(errorText(e, "Can't reach the game server.")); }
+  }
+
+  private async placeBet(i: number, auto = false) {
+    const set = this.settings()[i], a = r2(set.bet), min = this.cfg?.minBet ?? 1, max = this.cfg?.maxBet ?? Infinity;
+    const stop = (msg: string) => { this.toast(msg); if (auto) this.onEvent({ type: 'autostop', slot: i }); };
+    if (a < min || a > max) { stop('Bets must be between ' + money(min) + ' and ' + money(max) + '.'); return; }
+    const bal = balanceStore.balance;
+    if (bal != null && a > bal) { stop(auto ? 'Auto bet ' + SLOT_NAMES[i] + ' stopped: not enough balance.' : 'Not enough balance for that bet.'); return; }
+    const roundId = this.round?.id;
+    this.slots[i] = { status: 'placed', amount: a, queued: false, busy: true };
+    this.emit();
+    try {
+      const res = await this.client.placeBet(i, a, set.autoOn ? r2(set.autoAt) : null);
+      if (this.disposed) return;
+      balanceStore.set(res.balance);
+      if (!res.ok || !res.bet) { this.slots[i] = emptySlot(); stop(res.error || 'The bet was not accepted.'); }
+      else if (this.round?.id === roundId) { this.slots[i] = this.slotFromServer(res.bet, this.slots[i]); this.onEvent({ type: 'bet', slot: i }); }
+    } catch (e) {
+      if (this.disposed) return;
+      this.slots[i] = emptySlot();
+      stop(errorText(e, 'The bet failed.'));
+    }
+    this.emit();
+  }
+
+  private async cancelBet(i: number) {
+    this.slots[i] = { ...this.slots[i], busy: true }; this.emit();
+    try {
+      const res = await this.client.cancelBet(i);
+      if (this.disposed) return;
+      balanceStore.set(res.balance);
+      if (res.ok) this.slots[i] = emptySlot();
+      else { this.slots[i] = { ...this.slots[i], busy: false }; this.toast(res.error || 'The bet could not be cancelled.'); }
+    } catch (e) {
+      if (this.disposed) return;
+      this.slots[i] = { ...this.slots[i], busy: false }; this.toast(errorText(e, 'Cancel failed.'));
+    }
+    this.emit();
+  }
+
+  private async cashOut(i: number) {
+    const s = this.slots[i];
+    this.slots[i] = { ...s, busy: true }; this.emit();
+    try {
+      const res = await this.client.cashOut(i);
+      if (this.disposed) return;
+      balanceStore.set(res.balance);
+      if (res.ok && res.multiplier != null) this.markCashed(i, s.amount, res.multiplier, res.win ?? r2(s.amount * res.multiplier), res.balance === null);
+      else { this.slots[i] = { ...this.slots[i], busy: false }; this.toast(res.error || 'Too late: the round crashed first.'); }
+    } catch (e) {
+      if (this.disposed) return;
+      this.slots[i] = { ...this.slots[i], busy: false }; this.toast(errorText(e, 'Cash-out failed.'));
+    }
+    this.emit();
+  }
+
+  /** A confirmed cash-out, from the CashOut reply or the MyBet event, whichever arrives first. */
+  private markCashed(i: number, amount: number, at: number, pay: number, pending: boolean) {
+    const s = this.slots[i];
+    if (s.status === 'cashed') return;
+    this.slots[i] = { status: 'cashed', amount, at, pay, queued: s.queued, busy: false };
+    this.cashAt = at;
+    this.logBet(i, amount, at, pay);
+    this.addTop({ name: 'You', bet: amount, at, win: pay, round: this.round?.nonce ?? 0, you: true });
+    this.onEvent({ type: 'cashout', slot: i, at, pay });
+    if (pending) this.toast('Win confirmed. It will reach your balance shortly.');
+  }
+
+  /** The main button of a slot: place, cancel, cash out, or queue for the next round. */
+  action(i: number) {
+    const s = this.slots[i];
+    if (s.busy) return;
+    if (this.connection !== 'online' || !this.round) { this.toast("Not connected to the game server yet."); return; }
+    if (this.round.status === 'BETTING' && this.phase === 'betting') {
+      if (s.status === 'none') void this.placeBet(i);
+      else if (s.status === 'placed') void this.cancelBet(i);
+    } else if (this.phase === 'running' && s.status === 'active') void this.cashOut(i);
+    else { this.slots[i] = { ...s, queued: !s.queued }; this.emit(); }
   }
 
   private addTop(w: TopWin) {
@@ -221,116 +374,34 @@ export class GameController {
     list.push(w); list.sort((a, b) => b.win - a.win);
     topWins[this.scene.id] = list.slice(0, 12);
   }
-  private logBet(i: number, s: Slot, at: number | null, pay: number) {
-    myBets = [{ id: ++betId, game: this.scene.name, round: this.round.nonce, slot: i + 1, amount: s.amount, at, pay, result: 0, time: Date.now() }, ...myBets].slice(0, 60);
-  }
-
-  private finishRound(end: number) {
-    const sc = this.scene, o = this.round.out!;
-    this.phase = 'crashed'; this.crashTime = performance.now() / 1000; this.m = end; this.punch = 1;
-    this.slots = this.slots.map((s, i) => {
-      if (s.status !== 'active') return s;
-      this.wallet.lose(s.amount); this.logBet(i, s, null, 0);
-      return { ...s, status: 'lost' as const };
-    }) as [Slot, Slot];
-    myBets = myBets.map((b) => (b.round === this.round.nonce && b.result === 0 ? { ...b, result: sc.dual ? (o[this.route] as number) : end } : b));
-    this.bots = this.bots.map((b) => {
-      if (b.status !== 'in') return b;
-      return b.target <= this.crashFor(b.route) ? { ...b, status: 'cashed', at: b.target } : { ...b, status: 'lost' };
-    });
-    let v: number, detail: string, dot: string | null = null;
-    if (sc.routes && (sc.dual || (o.trunk as number) >= (sc.fork as number))) {
-      v = o[this.route] as number; dot = sc.routes[this.route].color;
-      detail = sc.routes.L.name + ' ' + x2(o.L as number) + ' · ' + sc.routes.R.name + ' ' + x2(o.R as number);
-    } else {
-      v = o.trunk as number; detail = sc.fork ? 'Crashed before the split at ' + x2(o.trunk as number) : 'Crashed at ' + x2(o.trunk as number);
-    }
-    const h = histories[sc.id];
-    h.unshift({ v, dot, detail }); if (h.length > 40) h.pop();
-    histories[sc.id] = h.slice();
-    this.prev = this.round;
-    this.onEvent({ type: 'crash', m: end });
-  }
-
-  /* ---------- player actions ---------- */
-  setRoute(k: RouteKey) { if (!this.isRouteLocked()) { this.route = k; this.emit(); } }
-
-  private placeBet(i: number, auto = false): boolean {
-    const a = r2(this.settings()[i].bet);
-    if (!(a >= 1)) { this.toast('The minimum bet is 1.00 credit.'); return false; }
-    if (!this.wallet.stake(a)) { this.toast(auto ? 'Auto bet ' + 'AB'[i] + ' stopped: not enough credits.' : 'Not enough credits for that bet. Lower it or reset your demo credits.'); return false; }
-    this.slots[i] = { status: 'placed', amount: a, queued: false };
-    this.onEvent({ type: 'bet', slot: i });
-    return true;
-  }
-  private cashOut(i: number, at: number, quiet = false) {
-    const s = this.slots[i];
-    if (s.status !== 'active') return;
-    const pay = r2(s.amount * at);
-    this.wallet.win(s.amount, pay);
-    this.slots[i] = { ...s, status: 'cashed', at, pay };
-    this.logBet(i, s, at, pay);
-    this.addTop({ name: 'You', bet: s.amount, at, win: pay, round: this.round.nonce, you: true });
-    this.cashAt = at;
-    if (quiet) this.toast('Cashed out at ' + x2(at) + ' when you left the game: +' + money(pay));
-    else this.onEvent({ type: 'cashout', slot: i, at, pay });
-  }
-  /** The main button of a slot: place, cancel, cash out, or queue for the next round. */
-  action(i: number) {
-    const s = this.slots[i];
-    if (this.phase === 'betting') {
-      if (s.status === 'none') this.placeBet(i);
-      else if (s.status === 'placed') { this.wallet.refund(s.amount); this.slots[i] = emptySlot(); }
-    } else if (this.phase === 'running' && s.status === 'active') this.cashOut(i, r2(this.m));
-    else this.slots[i] = { ...s, queued: !s.queued };
-    this.emit();
+  private logBet(i: number, amount: number, at: number | null, pay: number) {
+    const round = this.round?.id ?? 0;
+    if (myBets.some((b) => b.round === round && b.slot === i)) return;
+    myBets = [{ id: round + ':' + i, round, slot: i, amount, at, pay }, ...myBets].slice(0, 60);
   }
 
   /* ---------- frame ---------- */
   private frame() {
     const t = performance.now() / 1000, dt = Math.min(0.05, t - this.last); this.last = t;
-    const sc = this.scene;
     if (this.phase === 'betting') {
-      this.countdown = Math.max(0, BET_TIME - (t - this.phaseStart));
+      this.countdown = this.round ? Math.max(0, this.betEnd - t) : 0;
       const sec = Math.ceil(this.countdown);
-      if (sec !== this.lastTick && sec <= 3 && sec >= 1) this.onEvent({ type: 'tick', last: sec === 1 });
+      if (this.round && sec !== this.lastTick && sec <= 3 && sec >= 1) this.onEvent({ type: 'tick', last: sec === 1 });
       this.lastTick = sec;
-      if (this.countdown <= 0 && this.round.ready) this.startRun();
     } else if (this.phase === 'running') {
-      this.t = t - this.runStart;
-      let m = Math.exp(CG.K * this.t);
-      const o = this.round.out!;
-      if (sc.fork && !this.forkPassed && m >= sc.fork && (o.trunk as number) >= sc.fork) this.forkPassed = true;
-      const end = this.endPoint();
-      const set = this.settings();
-      this.slots.forEach((s, i) => {
-        if (s.status !== 'active') return;
-        const pc = this.crashFor(this.route), auto = set[i].autoOn ? r2(set[i].autoAt) : 0;
-        if (auto >= 1.01 && m >= auto && auto <= pc) this.cashOut(i, auto);
-        else if (sc.dual && m >= pc) { this.wallet.lose(s.amount); this.logBet(i, s, null, 0); this.slots[i] = { ...s, status: 'lost' }; }
-      });
+      /* between server ticks the multiplier follows the same curve the server uses; the server ends the round */
+      this.t = Math.max(0, t - this.runStart);
+      const m = Math.min(this.cfg?.maxMultiplier ?? 10000, Math.exp(this.growth * this.t));
       let changed = false;
       const bots = this.bots.map((b) => {
-        if (b.status !== 'in') return b;
-        const bc = this.crashFor(b.route);
-        if (m >= b.target && b.target <= bc) { changed = true; this.addTop({ name: b.name, bet: b.bet, at: b.target, win: r2(b.bet * b.target), round: this.round.nonce, you: false }); return { ...b, status: 'cashed' as const, at: b.target, when: performance.now() / 1000 }; }
-        if (sc.dual && m >= bc) { changed = true; return { ...b, status: 'lost' as const }; }
-        return b;
+        if (b.status !== 'in' || m < b.target) return b;
+        changed = true;
+        this.addTop({ name: b.name, bet: b.bet, at: b.target, win: r2(b.bet * b.target), round: this.round?.nonce ?? 0, you: false });
+        return { ...b, status: 'cashed' as const, at: b.target, when: t };
       });
       if (changed) this.bots = bots;
-      if (this.dual) (['L', 'R'] as RouteKey[]).forEach((k) => {
-        const D = this.dual![k], c = o[k] as number;
-        D.m = Math.min(m, c);
-        if (!D.dead && m >= c) { D.dead = true; D.t0 = t; }
-        D.age = D.dead ? t - (D.t0 as number) : 0;
-      });
-      if (m >= end) { m = end; this.m = m; this.finishRound(end); }
-      else {
-        this.m = m;
-        if (this.nextMilestone < MILESTONES.length && m >= MILESTONES[this.nextMilestone]) { this.onEvent({ type: 'milestone', m: MILESTONES[this.nextMilestone] }); this.nextMilestone++; }
-      }
-    } else if (t - this.crashTime > END_TIME) {
-      this.newRound();
+      this.m = m;
+      if (this.nextMilestone < MILESTONES.length && m >= MILESTONES[this.nextMilestone]) { this.onEvent({ type: 'milestone', m: MILESTONES[this.nextMilestone] }); this.nextMilestone++; }
     }
     this.draw(dt, t);
     this.emit();
@@ -347,15 +418,14 @@ export class GameController {
     const z = 1 + push + this.punch * 0.035;
     ctx.translate(W / 2, VH / 2); ctx.scale(z, z); ctx.translate(-W / 2, -VH / 2);
     const S: SceneState = {
-      phase: this.phase, m: this.m, p: Math.log(this.m), t: this.t, dt, time: t, countdown: this.countdown,
+      phase: this.phase, m: this.m, p: Math.log(this.m), t: this.t, dt, time: t, countdown: this.round ? this.countdown : this.betTime,
       crashAge: this.phase === 'crashed' ? t - this.crashTime : 0, cashAt: this.cashAt, route: this.route,
-      routes: this.scene.routes, fork: this.scene.fork, forkPassed: this.forkPassed, dual: this.dual,
+      routes: this.scene.routes, fork: undefined, forkPassed: false, dual: null,
     };
     try { this.scene.draw(ctx, W, VH, S, this.st); } catch (e) { console.error(e); }
-    // post: film grain, crash graph, crash flash
+    // post: film grain and crash flash
     ctx.setTransform(this.scale, 0, 0, this.scale, 0, 0);
     CG.U.grain(ctx, W, VH, 0.06);
-    if (showGraph && this.scene.graph !== false) this.drawGraph(ctx, W, t);
     if (this.punch > 0) {
       ctx.save(); ctx.globalCompositeOperation = 'screen';
       ctx.fillStyle = 'rgba(255,60,40,' + (this.punch * 0.35).toFixed(3) + ')'; ctx.fillRect(0, 0, W, VH);
@@ -363,122 +433,40 @@ export class GameController {
     }
   }
 
-  /* ---------- crash curve overlay ---------- */
-  private drawGraph(ctx: CanvasRenderingContext2D, W: number, now: number) {
-    const narrow = W < 800;
-    const x0 = narrow ? 40 : 52, x1 = W - 26, y0 = VH - 30, y1 = VH * (narrow ? 0.42 : 0.36);
-    const run = this.phase !== 'betting';
-    const tNow = run ? this.t : 0;
-    const tMax = Math.max(8, tNow * 1.12), mMax = Math.max(2, this.m * 1.15);
-    const X = (tt: number) => x0 + (tt / tMax) * (x1 - x0);
-    const Y = (mm: number) => y0 - ((mm - 1) / (mMax - 1)) * (y0 - y1);
-    const nice = (span: number, n: number, steps: number[]) => steps.find((s) => span / s <= n) || steps[steps.length - 1];
-    const mStep = nice(mMax - 1, 4, [0.2, 0.25, 0.5, 1, 2, 2.5, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000]);
-    const tStep = nice(tMax, 6, [1, 2, 5, 10, 15, 20, 30, 60, 120]);
-    const fmt = (v: number) => (mStep < 1 ? v.toFixed(1) : v.toFixed(0)) + '×';
-    ctx.save();
-    ctx.font = '600 11px "JetBrains Mono", monospace';
-    ctx.lineWidth = 1;
-    ctx.textAlign = 'right';
-    for (let v = 1; v <= mMax + 1e-6; v += mStep) {
-      const y = Y(v);
-      ctx.strokeStyle = 'rgba(255,255,255,0.07)'; ctx.setLineDash([4, 6]); ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke(); ctx.setLineDash([]);
-      ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillText(fmt(v), x0 - 7, y + 5);
-      ctx.fillStyle = 'rgba(255,255,255,0.66)'; ctx.fillText(fmt(v), x0 - 8, y + 4);
-    }
-    ctx.textAlign = 'center';
-    for (let s = tStep; s <= tMax; s += tStep) {
-      const x = X(s);
-      ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillText(s + 's', x + 1, y0 + 20);
-      ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.fillText(s + 's', x, y0 + 19);
-      ctx.strokeStyle = 'rgba(255,255,255,0.22)'; ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y0 + 5); ctx.stroke();
-    }
-    ctx.strokeStyle = 'rgba(255,255,255,0.3)'; ctx.beginPath(); ctx.moveTo(x0, y1 - 10); ctx.lineTo(x0, y0); ctx.lineTo(x1, y0); ctx.stroke();
-    if (run && tNow > 0) {
-      const crashed = this.phase === 'crashed';
-      const lanes: Array<{ col: string; cap: number }> = this.dual && this.scene.routes
-        ? (['L', 'R'] as RouteKey[]).map((k) => ({ col: this.scene.routes![k].color, cap: this.dual![k].m }))
-        : [{ col: crashed ? '#ff4d5e' : this.scene.accent, cap: this.m }];
-      for (const lane of lanes) {
-        const tEnd = Math.log(lane.cap) / CG.K, pts: Array<[number, number]> = [];
-        for (let k = 0; k <= 70; k++) { const tt = (tEnd * k) / 70; pts.push([X(tt), Y(Math.exp(CG.K * tt))]); }
-        const grad = ctx.createLinearGradient(0, y1, 0, y0);
-        grad.addColorStop(0, CG.U.rgba(lane.col, 0.3)); grad.addColorStop(1, CG.U.rgba(lane.col, 0.02));
-        ctx.fillStyle = grad; ctx.beginPath(); ctx.moveTo(pts[0][0], y0); pts.forEach((q) => ctx.lineTo(q[0], q[1])); ctx.lineTo(pts[pts.length - 1][0], y0); ctx.closePath(); ctx.fill();
-        ctx.shadowColor = lane.col; ctx.shadowBlur = 14; ctx.strokeStyle = lane.col; ctx.lineWidth = 4; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-        ctx.beginPath(); pts.forEach((q, i) => (i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]))); ctx.stroke();
-        ctx.shadowBlur = 0;
-        const e = pts[pts.length - 1];
-        CG.U.light(ctx, e[0], e[1], 28, lane.col, 0.9);
-        ctx.fillStyle = '#ffffff'; ctx.beginPath(); ctx.arc(e[0], e[1], 5, 0, Math.PI * 2); ctx.fill();
-      }
-      // other players cashing out along the curve
-      ctx.font = '600 11px "Sora", sans-serif'; ctx.textAlign = 'left';
-      for (const b of this.bots) {
-        if (b.status !== 'cashed' || !b.when) continue;
-        const age = now - b.when; if (age > 2.4) continue;
-        const x = X(Math.log(b.at) / CG.K), y = Y(b.at), a = Math.max(0, 1 - age / 2.4), rise = age * 14;
-        const label = b.name + ' ' + b.at.toFixed(2) + '×', w = ctx.measureText(label).width + 14;
-        ctx.globalAlpha = a;
-        ctx.fillStyle = 'rgba(8,12,20,0.85)'; CG.U.rr(ctx, x - 4, y - 30 - rise, w, 20, 10); ctx.fill();
-        ctx.strokeStyle = 'rgba(80,220,140,0.7)'; ctx.lineWidth = 1; ctx.stroke();
-        ctx.fillStyle = '#7dffb2'; ctx.fillText(label, x + 3, y - 16 - rise);
-        ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
-        ctx.globalAlpha = 1;
-      }
-      // your cash-out markers
-      this.slots.forEach((s, i) => {
-        if (s.status !== 'cashed' || !s.at) return;
-        const x = X(Math.log(s.at) / CG.K), y = Y(s.at);
-        ctx.fillStyle = '#ffd34d'; ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2); ctx.fill();
-        ctx.strokeStyle = '#1a1206'; ctx.lineWidth = 2; ctx.stroke();
-        ctx.font = '800 12px "Sora", sans-serif'; ctx.fillStyle = '#ffd34d'; ctx.fillText('You · ' + (i + 1), x + 10, y + 18);
-      });
-    }
-    ctx.restore();
-  }
-
   /* ---------- HUD text ---------- */
-  private resultText(): string {
-    const sc = this.scene, o = this.round.out!;
-    if (sc.dual && sc.routes) return sc.routes.L.name + ' collapsed at ' + x2(o.L as number) + ' · ' + sc.routes.R.name + ' at ' + x2(o.R as number);
-    if (sc.fork && sc.routes) {
-      if ((o.trunk as number) < sc.fork) return 'Collapsed at ' + x2(o.trunk as number) + ', before the split at ' + x2(sc.fork);
-      const me = this.route, other: RouteKey = me === 'L' ? 'R' : 'L';
-      return sc.routes[me].name + ' at ' + x2(o[me] as number) + ' · ' + sc.routes[other].name + ' would have reached ' + x2(o[other] as number);
-    }
-    return sc.crashLines ? sc.crashLines[this.round.nonce % sc.crashLines.length] : 'Round ' + this.round.nonce + ' crashed';
-  }
-
   private emit() {
-    const sc = this.scene;
-    const routeName = sc.routes ? sc.routes[this.route].name : '';
+    const sc = this.scene, r = this.round;
     let label: string, mult: string, sub: string;
-    if (this.phase === 'betting') {
-      label = 'Bets open'; mult = x2(1);
-      sub = (sc.dual ? 'Backing ' + routeName + ' · ' : sc.fork ? 'Riding ' + routeName + ' · ' : '') + 'Next round in ' + this.countdown.toFixed(1) + 's';
+    if (!r) {
+      label = this.connection === 'offline' ? 'Offline' : 'Connecting';
+      mult = x2(1);
+      sub = this.connection === 'offline' ? "Can't reach the game server" : 'Joining the game server…';
+    } else if (this.phase === 'betting') {
+      label = 'Bets open'; mult = x2(1); sub = 'Next round in ' + this.countdown.toFixed(1) + 's';
     } else if (this.phase === 'running') {
       label = sc.gauge(this.m); mult = x2(this.m);
-      if (sc.dual) sub = 'Backing ' + routeName;
-      else if (sc.fork) sub = this.forkPassed ? 'On the ' + routeName : 'Switch at ' + x2(sc.fork) + ' · Riding ' + routeName;
-      else sub = this.bots.filter((b) => b.status === 'in').length + this.slots.filter((s) => s.status === 'active').length + ' players still in';
-    } else { label = sc.crashWord; mult = x2(this.m); sub = this.resultText(); }
-    const mine = this.slots.reduce((s, x) => s + x.amount, 0);
+      sub = this.bots.filter((b) => b.status === 'in').length + this.slots.filter((s) => s.status === 'active').length + ' players still in';
+    } else {
+      label = sc.crashWord; mult = x2(this.m);
+      sub = sc.crashLines ? sc.crashLines[r.id % sc.crashLines.length] : 'Round ' + r.id + ' crashed';
+    }
+    const mine = this.slots.reduce((s, x) => s + (x.status === 'none' ? 0 : x.amount), 0);
     this.snap = {
-      phase: this.phase, m: this.m, countdown: this.countdown, route: this.route, routeLocked: this.isRouteLocked(), forkPassed: this.forkPassed,
+      phase: this.phase, m: this.m, countdown: this.countdown, betTime: this.betTime, route: this.route, routeLocked: this.isRouteLocked(),
       slots: [this.slots[0], this.slots[1]], bots: this.bots, history: histories[sc.id],
-      round: { nonce: this.round.nonce, hash: this.round.hash, client: this.round.client }, prev: this.prev, myBets, topWins: topWins[sc.id],
+      round: { id: r?.id ?? 0, nonce: r?.nonce ?? 0 }, fairness: this.fairness, myBets, topWins: topWins[sc.id],
       hud: { label, mult, sub },
       players: this.bots.length + this.slots.filter((s) => s.status !== 'none').length,
       wagered: this.bots.reduce((s, b) => s + b.bet, 0) + mine,
+      connection: this.connection, minBet: this.cfg?.minBet ?? 1, maxBet: this.cfg?.maxBet ?? 10000,
     };
     this.listeners.forEach((l) => l());
   }
 }
 
-/** Re-derive a finished round from its revealed seed and compare with what was published. */
-export async function verifyRound(scene: Scene, r: Round): Promise<boolean> {
-  const h = await CG.fair.sha256(r.seed);
-  const o = await CG.fair.outcome(scene, r.seed, r.client, r.nonce);
-  return h === r.hash && JSON.stringify(o) === JSON.stringify(r.out);
+/** True when the revealed server seed hashes to the hash that was published before its rounds. */
+export async function seedMatchesHash(seed: string, hash: string): Promise<boolean> {
+  const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(seed));
+  const hex = Array.from(new Uint8Array(d)).map((x) => x.toString(16).padStart(2, '0')).join('');
+  return hex === hash.toLowerCase();
 }

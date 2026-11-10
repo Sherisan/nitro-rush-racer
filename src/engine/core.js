@@ -1,10 +1,10 @@
-/* Shared crash engine: utilities, verifiable outcomes and the scene registry */
-/* Crash collection: shared utilities, verifiable outcomes and scene registry */
+/* Shared crash engine: drawing utilities, particles and the scene registry.
+   Crash points come from the GameEngineAPI server, never from this file. */
 export const CG = {};
 {
   CG.scenes = [];
   CG.register = (s) => CG.scenes.push(s);
-  CG.K = 0.09; /* multiplier growth: m(t) = e^(K·t), t in seconds */
+  CG.K = 0.09; /* default growth for lobby previews; live rounds use the server's growth rate */
 
   const U = (CG.U = {});
   U.clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -97,34 +97,5 @@ export const CG = {};
       }
       ctx.globalAlpha = 1;
     }
-  };
-
-  /* ---------- Verifiable outcomes (HMAC-SHA256) ---------- */
-  const enc = new TextEncoder();
-  const toHex = (buf) => Array.from(new Uint8Array(buf)).map((x) => x.toString(16).padStart(2, '0')).join('');
-  CG.fair = {
-    EDGE: 0.03,
-    MAX: 10000,
-    randomSeed(bytes) { const a = new Uint8Array(bytes || 32); crypto.getRandomValues(a); return toHex(a); },
-    async sha256(str) { return toHex(await crypto.subtle.digest('SHA-256', enc.encode(str))); },
-    async float(seed, msg) {
-      const key = await crypto.subtle.importKey('raw', enc.encode(seed), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-      const sig = toHex(await crypto.subtle.sign('HMAC', key, enc.encode(msg)));
-      return parseInt(sig.slice(0, 13), 16) / Math.pow(2, 52);
-    },
-    /* P(crash >= x) = 0.97 / x  -> 3% house edge, 3% of rounds bust at 1.00x */
-    crashFrom(r) { return Math.min(this.MAX, Math.max(1, Math.floor((100 * (1 - this.EDGE)) / (1 - r)) / 100)); },
-    /* after a split at `fork`: P(route >= x) = fork / x, so the edge is charged once, on the shared track */
-    routeFrom(r, fork) { return Math.min(this.MAX, Math.max(fork, Math.floor((100 * fork) / (1 - r)) / 100)); },
-    async outcome(game, seed, client, nonce) {
-      const base = client + ':' + nonce;
-      if (game.dual) {
-        return { trunk: null, L: this.crashFrom(await this.float(seed, base + ':L')), R: this.crashFrom(await this.float(seed, base + ':R')) };
-      }
-      const trunk = this.crashFrom(await this.float(seed, base + ':main'));
-      if (!game.fork) return { trunk };
-      if (trunk < game.fork) return { trunk, L: null, R: null };
-      return { trunk, L: this.routeFrom(await this.float(seed, base + ':L'), game.fork), R: this.routeFrom(await this.float(seed, base + ':R'), game.fork) };
-    },
   };
 }

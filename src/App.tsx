@@ -3,7 +3,7 @@ import { CG } from './engine/core.js';
 import { Lobby } from './components/Lobby';
 import { GameView } from './components/GameView';
 import { money } from './game/controller';
-import { wallet } from './game/wallet';
+import { balanceStore } from './game/balance';
 
 /* A build with a single game skips the lobby and opens straight into that game. */
 const SINGLE = CG.scenes.length === 1 ? CG.scenes[0] : null;
@@ -43,7 +43,7 @@ function Coin() {
 
 export function App() {
   const [gameId, setGameId] = useState<string | null>(fromHash);
-  const { balance, stats } = useSyncExternalStore(wallet.subscribe, wallet.getSnapshot);
+  const { balance, currency } = useSyncExternalStore(balanceStore.subscribe, balanceStore.getSnapshot);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const timer = useRef<number>(0);
   const [flash, setFlash] = useState<'up' | 'down' | null>(null);
@@ -51,7 +51,8 @@ export function App() {
   const [historyHost, setHistoryHost] = useState<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    if (balance !== lastBal.current) { setFlash(balance > lastBal.current ? 'up' : 'down'); lastBal.current = balance; const t = window.setTimeout(() => setFlash(null), 700); return () => window.clearTimeout(t); }
+    if (lastBal.current === null) { lastBal.current = balance; return; }
+    if (balance !== null && balance !== lastBal.current) { setFlash(balance > lastBal.current ? 'up' : 'down'); lastBal.current = balance; const t = window.setTimeout(() => setFlash(null), 700); return () => window.clearTimeout(t); }
   }, [balance]);
 
   const toast = useCallback((m: string) => {
@@ -90,9 +91,9 @@ export function App() {
                 onClick={(e) => { e.preventDefault(); open(s.id); }}><i />{s.name}</a>
             ))}
           </nav>}
-        <div className={'wallet' + (flash ? ' flash-' + flash : '')} title={'Session: ' + stats.rounds + ' bets, net ' + (stats.net >= 0 ? '+' : '−') + money(Math.abs(stats.net))}>
+        <div className={'wallet' + (flash ? ' flash-' + flash : '')} title="Balance from the game server">
           <Coin />
-          <div><span>Balance</span><strong>{money(balance)}</strong></div>
+          <div><span>Balance{currency ? ' · ' + currency : ''}</span><strong>{balance == null ? '–' : money(balance)}</strong></div>
         </div>
       </header>
 

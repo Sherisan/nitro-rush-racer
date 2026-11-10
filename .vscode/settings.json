@@ -1,0 +1,6 @@
+{
+  "git.scanRepositories": [
+    "GameEngineAPI"
+  ],
+  "scm.alwaysShowRepositories": true
+}
