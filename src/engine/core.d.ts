@@ -34,6 +34,8 @@ export interface Scene {
   blurb: string;
   mech: string;
   crashWord: string;
+  /** One-liners shown under the multiplier after a crash; one is picked per round. */
+  crashLines?: string[];
   cashWord: string;
   coin: string;
   tags?: Array<'split' | 'classic' | 'dual'>;

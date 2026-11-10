@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { CG } from '../engine/core.js';
 import type { RouteKey, Scene } from '../engine/core.js';
 import { BET_TIME, GameController, getClientSeed, getGraph, money, setClientSeed, setGraph, verifyRound, x2 } from '../game/controller';
@@ -13,13 +14,14 @@ const tier = (v: number) => (v >= 10 ? 'hi' : v >= 2 ? 'mid' : 'lo');
 const mask = (n: string) => (n.length <= 2 ? n : n[0] + '***' + n[n.length - 1]);
 const AV = ['#ef4444', '#f59e0b', '#22c55e', '#06b6d4', '#3b82f6', '#8b5cf6', '#ec4899', '#14b8a6'];
 const avColor = (n: string) => AV[[...n].reduce((s, c) => s + c.charCodeAt(0), 0) % AV.length];
+const SLOT_NAME = ['A', 'B'];
 
-interface Props { scene: Scene; toast: (m: string) => void; }
+interface Props { scene: Scene; toast: (m: string) => void; toastMsg: string | null; historyHost: HTMLElement | null; }
 interface Pop { id: number; text: string; sub: string; big: boolean; }
 
 const defaultSlot = (bet: number): SlotSettings => ({ bet, autoOn: false, autoAt: 2, autoBet: false });
 
-export function GameView({ scene, toast }: Props) {
+export function GameView({ scene, toast, toastMsg, historyHost }: Props) {
   const [slotSet, setSlotSet] = useState<[SlotSettings, SlotSettings]>(() => [defaultSlot(10), defaultSlot(5)]);
   const settings = useRef(slotSet); settings.current = slotSet;
   const [ctrl, setCtrl] = useState<GameController | null>(null);
@@ -76,100 +78,106 @@ export function GameView({ scene, toast }: Props) {
   }, [ctrl, modal]);
 
   const progress = snap && snap.phase === 'betting' ? snap.countdown / BET_TIME : 0;
+  const multState = !snap || snap.phase === 'betting' ? 'idle' : snap.phase === 'crashed' ? 'crashed' : snap.m >= 10 ? 'hot' : snap.m >= 2 ? 'warm' : 'run';
+  const resetCredits = () => { wallet.reset(); toast('Demo credits reset to 1,000.00'); };
 
   return (
-    <section className="game" onPointerDown={() => sound.unlock()}>
-      <div className="game-grid">
-        <div className="play">
-          <div className="play-top">
-            <div className="game-id">
-              <span className="gi-mark" aria-hidden="true" />
-              <h1>{scene.name}</h1>
-              <span className="gi-mech">{scene.mech}</span>
-            </div>
-            <div className="play-actions">
-              <button type="button" className="ghost-btn" onClick={() => setModal('how')}><InfoIcon />How to play</button>
-              <button type="button" className="ghost-btn fair-btn" onClick={() => setModal('fair')}><ShieldIcon />Provably fair</button>
-            </div>
-          </div>
+    <main className="layout" onPointerDown={() => sound.unlock()}>
+      {historyHost && createPortal(<History items={snap ? snap.history : []} />, historyHost)}
 
-          <History items={snap ? snap.history : []} />
-
-          <div className="stage" style={{ background: scene.bg }}>
-            <canvas ref={canvasRef} />
-            {snap && (
-              <>
-                <div className="stage-top">
-                  <span className="pill"><span className={'state-dot ' + snap.phase} />{snap.phase === 'running' ? 'Live' : snap.phase === 'betting' ? 'Bets open' : 'Round over'} · #{snap.round.nonce}</span>
-                  <div className="stage-tools">
-                    <span className="pill pill-players"><UsersIcon />{snap.players} · {money(snap.wagered)}</span>
-                    {scene.graph !== false && (
-                      <button type="button" className={'pill pill-btn' + (graph ? ' on' : '')} aria-pressed={graph} onClick={() => { setGraph(!graph); setGraphState(!graph); }} title="Show the multiplier curve"><ChartIcon />Curve</button>
-                    )}
-                  </div>
-                </div>
-                <div className="hud" data-phase={snap.phase} aria-live="polite">
-                  <span className="hud-label">{snap.hud.label}</span>
-                  <span className="hud-mult">{snap.hud.mult}</span>
-                  <span className="hud-sub">{snap.hud.sub}</span>
-                </div>
-                {snap.phase === 'betting' && <div className="countdown"><i style={{ transform: `scaleX(${progress})` }} /></div>}
-                <div className="pops">
-                  {pops.map((p) => <div key={p.id} className={'pop' + (p.big ? ' big' : '')}><span>{p.sub}</span><b>{p.text}</b></div>)}
-                </div>
-              </>
-            )}
-          </div>
-
-          {scene.routes && snap && (
-            <div className="route-bar">
-              <div className="route-info"><b>Pick your route</b><span>{scene.dual ? 'Locks at launch' : 'Locks at ' + x2(scene.fork as number) + ' · each route has its own crash point'}</span></div>
-              <div className="seg" role="group" aria-label="Route">
-                {(['L', 'R'] as RouteKey[]).map((k) => (
-                  <button key={k} id={'route' + k} type="button" className="seg-btn" style={{ ['--rc' as string]: scene.routes![k].color }}
-                    aria-pressed={snap.route === k} disabled={snap.routeLocked && snap.route !== k} onClick={() => ctrl?.setRoute(k)}>
-                    <span className="dot" />{scene.routes![k].name}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          <div className="slots">
-            {[0, 1].map((i) => (
-              <BetSlot key={i} index={i} set={slotSet[i]} slot={snap ? snap.slots[i] : null} phase={snap ? snap.phase : 'betting'} m={snap ? snap.m : 1}
-                balance={balance} onChange={(p) => updateSlot(i, p)} onAction={() => { sound.unlock(); ctrl?.action(i); }} />
-            ))}
-          </div>
-          {balance < 1 && <p className="low">You're out of demo credits. <button type="button" className="link" onClick={() => { wallet.reset(); toast('Demo credits reset to 1,000.00'); }}>Reset to 1,000</button></p>}
+      <aside className="side" aria-label="Bets">
+        <div className="tabs" role="tablist">
+          {([['all', 'All bets'], ['mine', 'My bets'], ['top', 'Top wins']] as const).map(([k, l]) => (
+            <button key={k} type="button" role="tab" aria-selected={tab === k} className={tab === k ? 'on' : ''} onClick={() => setTab(k)}>{l}</button>
+          ))}
         </div>
-
-        <aside className="bets-panel" aria-label="Bets">
-          <div className="tabs" role="tablist">
-            {([['all', 'All bets'], ['mine', 'My bets'], ['top', 'Top']] as const).map(([k, l]) => (
-              <button key={k} type="button" role="tab" aria-selected={tab === k} className={tab === k ? 'on' : ''} onClick={() => setTab(k)}>{l}</button>
-            ))}
-          </div>
-          {snap && tab === 'all' && <AllBets bots={snap.bots} slots={snap.slots} phase={snap.phase} route={snap.route} scene={scene} />}
+        <div className="pane" role="tabpanel">
+          {snap && tab === 'all' && <AllBets bots={snap.bots} slots={snap.slots} route={snap.route} scene={scene} wagered={snap.wagered} />}
           {snap && tab === 'mine' && <MyBets bets={snap.myBets} />}
           {snap && tab === 'top' && <TopWins wins={snap.topWins} />}
-        </aside>
-      </div>
+        </div>
+        <div className="side-foot">
+          <span>Demo credits, no real money</span>
+          <button type="button" className={'refill' + (balance < 1 ? ' low' : '')} onClick={resetCredits}>Reset</button>
+        </div>
+      </aside>
+
+      <section className="game" aria-label="Game">
+        <div className="stage" style={{ background: scene.bg }}>
+          <canvas ref={canvasRef} role="img" aria-label={scene.blurb} />
+          {snap && (
+            <>
+              <div className="hud" aria-live="polite">
+                <div className="tag"><b>Round {snap.round.nonce.toLocaleString('en-US')}</b> · {snap.hud.label}</div>
+                <div className="mult" data-state={multState}>{snap.hud.mult}</div>
+                <div className="status">{snap.hud.sub}</div>
+                {snap.phase === 'betting' && <div className="bar"><i style={{ transform: `scaleX(${progress})` }} /></div>}
+              </div>
+              <div className="corner">
+                <SoundChip />
+                <button type="button" className="chip" aria-label="How to play" onClick={() => setModal('how')}><InfoIcon /><span className="lbl">How to play</span></button>
+                <button type="button" className="chip chip-fair" aria-label="Provably fair" onClick={() => setModal('fair')}><ShieldIcon /><span className="lbl">Provably fair</span></button>
+                {scene.graph !== false && (
+                  <button type="button" className={'chip' + (graph ? ' on' : '')} aria-pressed={graph} aria-label="Multiplier curve" onClick={() => { setGraph(!graph); setGraphState(!graph); }}><ChartIcon /><span className="lbl">Curve</span></button>
+                )}
+                <div className="chip">Racers <b>{snap.players}</b></div>
+              </div>
+              <div className="pops">
+                {pops.map((p) => <div key={p.id} className={'pop' + (p.big ? ' big' : '')}><span>{p.sub}</span><b>{p.text}</b></div>)}
+              </div>
+              <div className="stage-toast" role="status" hidden={!toastMsg}><span>{toastMsg}</span></div>
+            </>
+          )}
+        </div>
+
+        {scene.routes && snap && (
+          <div className="route-bar">
+            <div className="route-info"><b>Pick your route</b><span>{scene.dual ? 'Locks at launch' : 'Locks at ' + x2(scene.fork as number) + ' · each route has its own crash point'}</span></div>
+            <div className="seg" role="group" aria-label="Route">
+              {(['L', 'R'] as RouteKey[]).map((k) => (
+                <button key={k} id={'route' + k} type="button" className="seg-btn" style={{ ['--rc' as string]: scene.routes![k].color }}
+                  aria-pressed={snap.route === k} disabled={snap.routeLocked && snap.route !== k} onClick={() => ctrl?.setRoute(k)}>
+                  <span className="dot" />{scene.routes![k].name}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="slots">
+          {[0, 1].map((i) => (
+            <BetSlot key={i} index={i} set={slotSet[i]} slot={snap ? snap.slots[i] : null} phase={snap ? snap.phase : 'betting'} m={snap ? snap.m : 1}
+              balance={balance} onChange={(p) => updateSlot(i, p)} onAction={() => { sound.unlock(); ctrl?.action(i); }} />
+          ))}
+        </div>
+      </section>
 
       {modal && (
         <Modal title={modal === 'how' ? 'How to play ' + scene.name : 'Provably fair'} onClose={() => setModal(null)}>
           {modal === 'how' ? <HowTo scene={scene} /> : snap ? <Fairness scene={scene} round={snap.round} prev={snap.prev} toast={toast} /> : null}
         </Modal>
       )}
-    </section>
+    </main>
   );
 }
 
 /* ---------- icons ---------- */
-function ShieldIcon() { return <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3Zm-1.2 14.2-3.5-3.5 1.4-1.4 2.1 2.1 4.9-4.9 1.4 1.4-6.3 6.3Z" /></svg>; }
-function InfoIcon() { return <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm1 15h-2v-6h2v6Zm0-8h-2V7h2v2Z" /></svg>; }
-function UsersIcon() { return <svg width="13" height="13" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm7 0a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM9 13c-3.3 0-7 1.7-7 4v3h14v-3c0-2.3-3.7-4-7-4Zm7 0c-.5 0-1 0-1.5.1 1.5 1 2.5 2.3 2.5 3.9v3h5v-3c0-2.2-3.4-4-6-4Z" /></svg>; }
-function ChartIcon() { return <svg width="13" height="13" viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" d="M3 20h18M4 17c6 0 10-4 15-13" /></svg>; }
+function ShieldIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3Zm-1.2 14.2-3.5-3.5 1.4-1.4 2.1 2.1 4.9-4.9 1.4 1.4-6.3 6.3Z" /></svg>; }
+function InfoIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm1 15h-2v-6h2v6Zm0-8h-2V7h2v2Z" /></svg>; }
+function ChartIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" d="M3 20h18M4 17c6 0 10-4 15-13" /></svg>; }
+
+function SoundChip() {
+  const muted = useSyncExternalStore(sound.subscribe, sound.getSnapshot);
+  return (
+    <button type="button" className="chip" aria-pressed={!muted} aria-label={muted ? 'Turn sound on' : 'Turn sound off'} onClick={() => { sound.unlock(); sound.setMuted(!muted); }}>
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path fill="currentColor" d="M4 9v6h4l5 4V5L8 9H4Z" />
+        {muted ? <path stroke="currentColor" strokeWidth="2" strokeLinecap="round" d="m16 9 5 6m0-6-5 6" /> : <path fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" d="M16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12" />}
+      </svg>
+      <span className="lbl">{muted ? 'Sound off' : 'Sound on'}</span>
+    </button>
+  );
+}
 
 /* ---------- modal ---------- */
 function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
@@ -187,7 +195,7 @@ function Modal({ title, onClose, children }: { title: string; onClose: () => voi
 
 function HowTo({ scene }: { scene: Scene }) {
   const steps: Array<[string, string]> = [
-    ['Place a bet', 'Set an amount in Bet 1, Bet 2 or both while the countdown runs, then press Bet.'],
+    ['Place a bet', 'Set an amount in Bet A, Bet B or both while the countdown runs, then press Place bet.'],
     ['Watch it climb', 'When the round starts, the multiplier rises from 1.00× and so does what your bet would pay.'],
     ['Cash out in time', 'Press Cash out before the round crashes to win your bet times the multiplier. If it crashes first, the bet is lost.'],
   ];
@@ -202,7 +210,8 @@ function HowTo({ scene }: { scene: Scene }) {
         <div><span>Top multiplier</span><b>10,000×</b></div>
         <div><span>Rounds that bust at 1.00×</span><b>3%</b></div>
       </div>
-      <p className="note">Use <b>Auto</b> on a bet panel to bet every round or cash out at a set multiplier. Space bar bets or cashes out on Bet 1. Demo credits have no cash value.</p>
+      <p className="note">Turn on <b>Auto bet</b> to bet every round, or <b>Auto cash out</b> to collect at a set multiplier. Space bar bets or cashes out on Bet A.</p>
+      <p className="note">Demo credits have no cash value and can't be bought or withdrawn. Every game returns 97% of stakes over the long run, so expect to lose about 3% of what you bet.</p>
     </div>
   );
 }
@@ -212,153 +221,143 @@ function BetSlot({ index, set, slot, phase, m, balance, onChange, onAction }: {
   index: number; set: SlotSettings; slot: Slot | null; phase: string; m: number; balance: number;
   onChange: (p: Partial<SlotSettings>) => void; onAction: () => void;
 }) {
-  const [mode, setMode] = useState<'bet' | 'auto'>('bet');
+  const name = 'Bet ' + SLOT_NAME[index];
   const [betText, setBetText] = useState(set.bet.toFixed(2));
   const [autoText, setAutoText] = useState(set.autoAt.toFixed(2));
   useEffect(() => { setBetText(set.bet.toFixed(2)); }, [set.bet]);
   const commitBet = (v: number) => { const n = Math.max(1, r2(v || 0)); setBetText(n.toFixed(2)); onChange({ bet: n }); };
   const s = slot ? slot.status : 'none';
-  let label: string, sub: string, cls: string;
-  if (phase === 'betting' && s === 'none') { label = 'Bet'; sub = money(set.bet) + ' credits'; cls = 'go'; }
-  else if (phase === 'betting' && s === 'placed') { label = 'Cancel'; sub = 'Waiting for the round'; cls = 'stop'; }
-  else if (phase === 'running' && s === 'active' && slot) { label = 'Cash out'; sub = money(r2(slot.amount * m)); cls = 'cash'; }
-  else if (slot?.queued) { label = 'Cancel'; sub = 'Queued for next round'; cls = 'stop'; }
-  else { label = 'Bet'; sub = 'Next round · ' + money(set.bet); cls = 'go dim'; }
+  let label: string, sub: string, mode: string;
+  if (phase === 'betting' && s === 'none') { mode = 'bet'; label = 'Place bet'; sub = money(set.bet) + ' credits'; }
+  else if (phase === 'betting' && s === 'placed' && slot) { mode = 'cancel'; label = 'Cancel'; sub = money(slot.amount) + ' on this round'; }
+  else if (phase === 'running' && s === 'active' && slot) { mode = 'cash'; label = 'Cash out'; sub = money(r2(slot.amount * m)) + ' at ' + x2(m); }
+  else if (slot?.queued) { mode = 'queued'; label = 'Cancel'; sub = money(set.bet) + ' waiting for next round'; }
+  else {
+    mode = 'next'; label = 'Bet next round';
+    sub = s === 'cashed' && slot ? 'Won ' + money(slot.pay as number) + ' at ' + x2(slot.at as number) : s === 'lost' && slot ? 'Lost ' + money(slot.amount) : money(set.bet) + ' credits';
+  }
   const locked = s === 'placed' || s === 'active';
-  const result = s === 'cashed' && slot ? { t: 'Won ' + money(slot.pay as number), c: 'win' } : s === 'lost' && slot ? { t: 'Lost ' + money(slot.amount), c: 'loss' } : null;
   return (
-    <div className={'slot' + (s === 'active' ? ' live' : '') + (result ? ' ' + result.c : '')}>
+    <div className={'slot' + (s === 'active' ? ' live' : '')}>
       <div className="slot-head">
-        <div className="mini-tabs" role="tablist" aria-label={'Bet ' + (index + 1) + ' mode'}>
-          <button type="button" role="tab" aria-selected={mode === 'bet'} className={mode === 'bet' ? 'on' : ''} onClick={() => setMode('bet')}>Bet</button>
-          <button type="button" role="tab" aria-selected={mode === 'auto'} className={mode === 'auto' ? 'on' : ''} onClick={() => setMode('auto')}>Auto{(set.autoBet || set.autoOn) && <i className="auto-dot" />}</button>
+        <span className="slot-name">{name}</span>
+        <label className="sw">
+          <input id={'autobet' + index} type="checkbox" checked={set.autoBet} onChange={(e) => onChange({ autoBet: e.target.checked })} />
+          <i aria-hidden="true" />Auto bet
+        </label>
+        <div className="auto-grp">
+          <label className="sw">
+            <input id={'auto' + index} type="checkbox" checked={set.autoOn} onChange={(e) => onChange({ autoOn: e.target.checked })} />
+            <i aria-hidden="true" />Auto cash out
+          </label>
+          <span className="auto-at">
+            <input id={'autoAt' + index} type="number" inputMode="decimal" min="1.01" step="0.1" value={autoText} disabled={!set.autoOn}
+              onChange={(e) => { setAutoText(e.target.value); const v = parseFloat(e.target.value); if (v >= 1.01) onChange({ autoAt: r2(v) }); }}
+              onBlur={() => { const v = Math.max(1.01, r2(parseFloat(autoText) || 2)); setAutoText(v.toFixed(2)); onChange({ autoAt: v }); }}
+              aria-label={'Auto cash out multiplier for ' + name} />×
+          </span>
         </div>
-        {result ? <span className={'slot-result ' + result.c}>{result.t}</span> : <span className="slot-name">Bet {index + 1}</span>}
       </div>
       <div className="slot-body">
-        <div className="slot-controls">
-          <div className="amount">
-            <button type="button" aria-label={'Lower bet ' + (index + 1)} disabled={locked} onClick={() => commitBet(set.bet - (set.bet > 10 ? 5 : 1))}>−</button>
+        <div>
+          <div className="stepper">
+            <button type="button" className="step" aria-label={'Lower ' + name} disabled={locked} onClick={() => commitBet(set.bet - (set.bet > 10 ? 5 : 1))}>−</button>
             <input id={'bet' + index} type="number" inputMode="decimal" min="1" step="1" value={betText} disabled={locked}
               onChange={(e) => { setBetText(e.target.value); const v = parseFloat(e.target.value); if (v >= 1) onChange({ bet: r2(v) }); }}
-              onBlur={() => commitBet(parseFloat(betText))} aria-label={'Bet ' + (index + 1) + ' amount'} />
-            <button type="button" aria-label={'Raise bet ' + (index + 1)} disabled={locked} onClick={() => commitBet(set.bet + (set.bet >= 10 ? 5 : 1))}>+</button>
+              onBlur={() => commitBet(parseFloat(betText))} aria-label={name + ' amount'} />
+            <button type="button" className="step" aria-label={'Raise ' + name} disabled={locked} onClick={() => commitBet(set.bet + (set.bet >= 10 ? 5 : 1))}>+</button>
           </div>
           <div className="quick">
             {[10, 50, 100, 500].map((v) => <button key={v} type="button" disabled={locked} onClick={() => commitBet(Math.min(v, Math.max(1, Math.floor(balance))))}>{v}</button>)}
           </div>
         </div>
-        <button type="button" className={'act ' + cls} onClick={onAction}>
-          <span className="act-label">{label}</span>
-          <span className="act-sub">{sub}</span>
+        <button type="button" className="action" data-mode={mode} onClick={onAction}>
+          <span>{label}</span>
+          <small>{sub}</small>
         </button>
       </div>
-      {mode === 'auto' && (
-        <div className="auto-panel">
-          <label className="toggle">
-            <input id={'autobet' + index} type="checkbox" checked={set.autoBet} onChange={(e) => onChange({ autoBet: e.target.checked })} />
-            <span className="switch" aria-hidden="true" />Auto bet every round
-          </label>
-          <div className="auto-row">
-            <label className="toggle">
-              <input id={'auto' + index} type="checkbox" checked={set.autoOn} onChange={(e) => onChange({ autoOn: e.target.checked })} />
-              <span className="switch" aria-hidden="true" />Auto cash out at
-            </label>
-            <div className="auto">
-              <input id={'autoAt' + index} type="number" inputMode="decimal" min="1.01" step="0.1" value={autoText} disabled={!set.autoOn}
-                onChange={(e) => { setAutoText(e.target.value); const v = parseFloat(e.target.value); if (v >= 1.01) onChange({ autoAt: r2(v) }); }}
-                onBlur={() => { const v = Math.max(1.01, r2(parseFloat(autoText) || 2)); setAutoText(v.toFixed(2)); onChange({ autoAt: v }); }}
-                aria-label={'Auto cash out multiplier for bet ' + (index + 1)} />
-              <span>×</span>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
 
-/* ---------- history pills ---------- */
+/* ---------- result strip ---------- */
 const History = memo(function History({ items }: { items: HistoryEntry[] }) {
+  if (items.length === 0) return <span className="hist-empty">Recent results will line up here</span>;
   return (
-    <div className="history" aria-label="Recent results">
-      {items.length === 0 ? <span className="hist-empty">Recent results will line up here</span> :
-        items.map((e, i) => (
-          <span key={items.length - i} className={'mpill ' + tier(e.v) + (i === 0 ? ' latest' : '')} title={e.detail}>
-            {e.dot && <i style={{ background: e.dot }} />}{x2(e.v)}
-          </span>
-        ))}
-    </div>
+    <>
+      {items.map((e, i) => (
+        <span key={items.length - i} className={'mpill ' + tier(e.v) + (i === 0 ? ' latest' : '')} title={e.detail}>
+          {e.dot && <i style={{ background: e.dot }} />}{x2(e.v)}
+        </span>
+      ))}
+    </>
   );
 });
 
-/* ---------- bets panel ---------- */
+/* ---------- bets rail ---------- */
 function Avatar({ name, you }: { name: string; you?: boolean }) {
-  return <span className={'avatar' + (you ? ' you' : '')} style={{ background: you ? undefined : avColor(name) }} aria-hidden="true">{you ? 'You' : name[0]}</span>;
+  return <span className={'avatar' + (you ? ' you' : '')} style={{ background: you ? undefined : avColor(name) }} aria-hidden="true">{you ? 'ME' : name[0]}</span>;
 }
-const AllBets = memo(function AllBets({ bots, slots, phase, route, scene }: { bots: Bot[]; slots: [Slot, Slot]; phase: string; route: RouteKey; scene: Scene }) {
-  const total = bots.length + slots.filter((s) => s.status !== 'none').length;
-  const won = bots.reduce((s, b) => s + (b.status === 'cashed' ? r2(b.bet * b.at) : 0), 0) + slots.reduce((s, x) => s + (x.pay || 0), 0);
+const ListHead = ({ first }: { first: string }) => <li className="head"><span>{first}</span><span>Bet</span><span>Out</span><span>Result</span></li>;
+
+const AllBets = memo(function AllBets({ bots, slots, route, scene, wagered }: { bots: Bot[]; slots: [Slot, Slot]; route: RouteKey; scene: Scene; wagered: number }) {
   const routeDot = (k: RouteKey) => scene.routes ? <i className="rdot" style={{ background: scene.routes[k].color }} title={scene.routes[k].name} /> : null;
-  const cell = (st: string, at?: number) => st === 'cashed' ? <span className={'mpill sm ' + tier(at as number)}>{x2(at as number)}</span> : st === 'lost' ? <span className="lost-tag">Lost</span> : <span className="muted">{phase === 'betting' ? '—' : 'In'}</span>;
   const rows: Array<{ key: string; name: string; you: boolean; bet: number; st: string; at?: number; win: number; route: RouteKey }> = [];
-  slots.forEach((s, i) => { if (s.status !== 'none') rows.push({ key: 'me' + i, name: 'You (' + (i + 1) + ')', you: true, bet: s.amount, st: s.status, at: s.at, win: s.pay || 0, route }); });
+  slots.forEach((s, i) => { if (s.status !== 'none') rows.push({ key: 'me' + i, name: 'You · ' + SLOT_NAME[i], you: true, bet: s.amount, st: s.status, at: s.at, win: s.pay || 0, route }); });
   bots.forEach((b) => rows.push({ key: b.name, name: mask(b.name), you: false, bet: b.bet, st: b.status, at: b.at, win: b.status === 'cashed' ? r2(b.bet * b.at) : 0, route: b.route }));
   return (
-    <div className="bets-body">
-      <div className="bets-sum"><span><b>{total}</b> bets this round</span><span>Paid <b className="pos">{money(won)}</b></span></div>
-      <div className="bets-head"><span>Player</span><span>Bet</span><span>×</span><span>Win</span></div>
-      <ul className="bets-list">
+    <>
+      <div className="sum"><span>{rows.length} bets this round</span><strong>{money(wagered)}</strong></div>
+      <ol className="list">
+        <ListHead first="Player" />
         {rows.map((r) => (
-          <li key={r.key} className={(r.you ? 'you ' : '') + (r.st === 'cashed' ? 'won' : '')}>
+          <li key={r.key} className={[r.you ? 'you' : '', r.st === 'cashed' ? 'won' : '', r.st === 'lost' ? 'lost' : ''].join(' ').trim()}>
             <span className="who"><Avatar name={r.name} you={r.you} />{routeDot(r.route)}<span className="nm">{r.name}</span></span>
-            <span className="num">{money(r.bet)}</span>
-            <span>{cell(r.st, r.at)}</span>
-            <span className="num">{r.win ? money(r.win) : ''}</span>
+            <span className="bet">{money(r.bet)}</span>
+            <span className="at">{r.st === 'cashed' ? x2(r.at as number) : '–'}</span>
+            <span className="win">{r.st === 'cashed' ? '+' + money(r.win) : r.st === 'lost' ? '−' + money(r.bet) : '–'}</span>
           </li>
         ))}
-      </ul>
+      </ol>
       <p className="note small">Other players are simulated for this demo.</p>
-    </div>
+    </>
   );
 });
 
 function MyBets({ bets }: { bets: MyBet[] }) {
-  if (!bets.length) return <div className="bets-body"><p className="empty">Your settled bets from this session appear here, from every game.</p></div>;
+  if (!bets.length) return <p className="empty">Your settled bets from this session appear here.</p>;
   return (
-    <div className="bets-body">
-      <div className="bets-head"><span>Game</span><span>Bet</span><span>×</span><span>Win</span></div>
-      <ul className="bets-list">
-        {bets.map((b) => (
-          <li key={b.id} className={b.at ? 'won' : ''}>
-            <span className="who stack"><span className="nm">{b.game}</span><span className="muted tiny">#{b.round} · Bet {b.slot} · crashed {x2(b.result || 1)}</span></span>
-            <span className="num">{money(b.amount)}</span>
-            <span>{b.at ? <span className={'mpill sm ' + tier(b.at)}>{x2(b.at)}</span> : <span className="lost-tag">Lost</span>}</span>
-            <span className="num">{b.at ? money(b.pay) : ''}</span>
-          </li>
-        ))}
-      </ul>
-    </div>
+    <ol className="list">
+      <ListHead first="Round" />
+      {bets.map((b) => (
+        <li key={b.id} className={b.at ? 'won' : 'lost'}>
+          <span className="who"><span className="nm">{'#' + b.round.toLocaleString('en-US') + ' · ' + SLOT_NAME[b.slot - 1]}</span></span>
+          <span className="bet">{money(b.amount)}</span>
+          <span className="at">{b.at ? x2(b.at) : '–'}</span>
+          <span className="win">{b.at ? '+' + money(b.pay) : '−' + money(b.amount)}</span>
+        </li>
+      ))}
+    </ol>
   );
 }
 
 function TopWins({ wins }: { wins: TopWin[] }) {
-  if (!wins.length) return <div className="bets-body"><p className="empty">The biggest wins in this game appear here as rounds are played.</p></div>;
+  if (!wins.length) return <p className="empty">The biggest wins appear here as rounds are played.</p>;
   return (
-    <div className="bets-body">
-      <div className="bets-head"><span>Player</span><span>Bet</span><span>×</span><span>Win</span></div>
-      <ul className="bets-list">
+    <>
+      <ol className="list">
+        <ListHead first="Player" />
         {wins.map((w, i) => (
           <li key={i} className={w.you ? 'you won' : 'won'}>
             <span className="who"><span className="rank">{i + 1}</span><Avatar name={w.name} you={w.you} /><span className="nm">{w.you ? 'You' : mask(w.name)}</span></span>
-            <span className="num">{money(w.bet)}</span>
-            <span><span className={'mpill sm ' + tier(w.at)}>{x2(w.at)}</span></span>
-            <span className="num">{money(w.win)}</span>
+            <span className="bet">{money(w.bet)}</span>
+            <span className="at">{x2(w.at)}</span>
+            <span className="win">{'+' + money(w.win)}</span>
           </li>
         ))}
-      </ul>
+      </ol>
       <p className="note small">This session only. Other players are simulated.</p>
-    </div>
+    </>
   );
 }
 

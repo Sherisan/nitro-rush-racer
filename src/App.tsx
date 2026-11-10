@@ -4,7 +4,6 @@ import { Lobby } from './components/Lobby';
 import { GameView } from './components/GameView';
 import { money } from './game/controller';
 import { wallet } from './game/wallet';
-import { sound } from './game/audio';
 
 /* A build with a single game skips the lobby and opens straight into that game. */
 const SINGLE = CG.scenes.length === 1 ? CG.scenes[0] : null;
@@ -17,27 +16,28 @@ const fromHash = () => {
 
 function Logo() {
   return (
-    <svg className="logo-mark" width="34" height="34" viewBox="0 0 40 40" aria-hidden="true">
+    <svg className="logo" viewBox="0 0 44 44" aria-hidden="true">
       <defs>
-        <linearGradient id="lg-gold" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stopColor="#fff1b0" /><stop offset="0.45" stopColor="#f2b33d" /><stop offset="1" stopColor="#8a5a12" /></linearGradient>
+        <linearGradient id="lg-nitro" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#8cf5ff" /><stop offset="1" stopColor="#0a6cff" /></linearGradient>
+        <clipPath id="lc-nitro"><circle cx="22" cy="22" r="21" /></clipPath>
       </defs>
-      <path d="M20 2 36 11v18L20 38 4 29V11Z" fill="#1a140c" stroke="url(#lg-gold)" strokeWidth="2" />
-      <path d="M11 27 19 13l4 7 3-4 4 11Z" fill="url(#lg-gold)" />
-      <circle cx="27" cy="12" r="2.2" fill="#fff1b0" />
+      <circle cx="22" cy="22" r="21" fill="url(#lg-nitro)" />
+      <g clipPath="url(#lc-nitro)">
+        <path d="M18 24h8l16 22H2z" fill="#0b1224" />
+        <path d="M21.3 27h1.4l.4 4h-2.2zM20.7 34h2.6l.6 7h-3.8z" fill="#fff" />
+      </g>
+      <path d="M26 4 13 21h7l-3 9 13-15h-7z" fill="#fff" stroke="#0b1224" strokeWidth="1.2" strokeLinejoin="round" />
     </svg>
   );
 }
 
-function SoundToggle() {
-  const muted = useSyncExternalStore(sound.subscribe, sound.getSnapshot);
+function Coin() {
   return (
-    <button type="button" className="icon-btn" aria-pressed={!muted} aria-label={muted ? 'Turn sound on' : 'Turn sound off'} title={muted ? 'Sound off' : 'Sound on'}
-      onClick={() => { sound.unlock(); sound.setMuted(!muted); }}>
-      <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
-        <path fill="currentColor" d="M4 9v6h4l5 4V5L8 9H4Z" />
-        {muted ? <path stroke="currentColor" strokeWidth="2" strokeLinecap="round" d="m16 9 5 6m0-6-5 6" /> : <path fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" d="M16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12" />}
-      </svg>
-    </button>
+    <svg viewBox="0 0 28 28" aria-hidden="true">
+      <circle cx="14" cy="14" r="13" fill="#22e6ff" />
+      <circle cx="14" cy="14" r="10" fill="none" stroke="#0a6c86" strokeWidth="1.5" />
+      <path d="M15.6 6.5 9 15h4.4l-1 6.5L19 13h-4.4z" fill="#07303d" />
+    </svg>
   );
 }
 
@@ -48,6 +48,7 @@ export function App() {
   const timer = useRef<number>(0);
   const [flash, setFlash] = useState<'up' | 'down' | null>(null);
   const lastBal = useRef(balance);
+  const [historyHost, setHistoryHost] = useState<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (balance !== lastBal.current) { setFlash(balance > lastBal.current ? 'up' : 'down'); lastBal.current = balance; const t = window.setTimeout(() => setFlash(null), 700); return () => window.clearTimeout(t); }
@@ -71,44 +72,44 @@ export function App() {
     document.title = SINGLE ? SINGLE.name : scene ? scene.name + ' · Gold Fever Crash Collection' : 'Gold Fever Crash Collection';
   }, [scene]);
 
+  const [wordA, ...wordB] = (SINGLE ? SINGLE.name : 'Gold Fever').split(' ');
+
   return (
-    <div className="app" style={scene ? { ['--acc' as string]: scene.accent } : undefined}>
+    <div className={'app' + (scene ? ' in-game' : '')} style={scene ? { ['--acc' as string]: scene.accent } : undefined}>
       <header className="top">
-        <div className="top-inner">
-          <a href="#" className="brand" onClick={(e) => { e.preventDefault(); open(null); }}>
-            <Logo />
-            <span className="brand-text"><span className="brand-mark">{SINGLE ? SINGLE.name : 'Gold Fever'}</span><span className="brand-sub">{SINGLE ? SINGLE.sub : 'Crash Collection'}</span></span>
-          </a>
-          {SINGLE ? <span className="game-strip" /> : <nav className="game-strip" aria-label="Games">
-            <a href="#" className={'gs-item' + (scene ? '' : ' on')} onClick={(e) => { e.preventDefault(); open(null); }}>Lobby</a>
+        <a href="#" className="brand" onClick={(e) => { e.preventDefault(); open(null); }}>
+          <Logo />
+          <span className="word"><span>{SINGLE ? SINGLE.sub : 'Crash Collection'}</span><b>{wordA} <i>{wordB.join(' ')}</i></b></span>
+        </a>
+        {scene
+          ? <div className="history" ref={setHistoryHost} aria-label="Recent rounds, newest first" />
+          : <nav className="game-strip" aria-label="Games">
+            <a href="#" className="gs-item on" onClick={(e) => { e.preventDefault(); open(null); }}>Lobby</a>
             {CG.scenes.map((s) => (
-              <a key={s.id} href={'#' + s.id} className={'gs-item' + (scene && scene.id === s.id ? ' on' : '')} style={{ ['--acc' as string]: s.accent }}
+              <a key={s.id} href={'#' + s.id} className="gs-item" style={{ ['--acc' as string]: s.accent }}
                 onClick={(e) => { e.preventDefault(); open(s.id); }}><i />{s.name}</a>
             ))}
           </nav>}
-          <div className="wallet">
-            <SoundToggle />
-            <div className={'balance' + (flash ? ' flash-' + flash : '')} title={'Session: ' + stats.rounds + ' bets, net ' + (stats.net >= 0 ? '+' : '−') + money(Math.abs(stats.net))}>
-              <span className="bal-icon" aria-hidden="true">◆</span>
-              <span className="bal-text"><span>Demo credits</span><b>{money(balance)}</b></span>
-            </div>
-            <button type="button" className="reset" onClick={() => { wallet.reset(); toast('Demo credits reset to 1,000.00'); }}>Reset</button>
-          </div>
+        <div className={'wallet' + (flash ? ' flash-' + flash : '')} title={'Session: ' + stats.rounds + ' bets, net ' + (stats.net >= 0 ? '+' : '−') + money(Math.abs(stats.net))}>
+          <Coin />
+          <div><span>Balance</span><strong>{money(balance)}</strong></div>
         </div>
       </header>
 
-      <main className="shell">
-        {scene ? <GameView key={scene.id} scene={scene} toast={toast} /> : <Lobby onOpen={open} />}
-      </main>
+      {scene
+        ? <GameView key={scene.id} scene={scene} toast={toast} toastMsg={toastMsg} historyHost={historyHost} />
+        : <main className="shell"><Lobby onOpen={open} /></main>}
 
-      <footer className="foot">
-        <div className="shell foot-inner">
-          <p>Demo credits have no cash value and can't be bought or withdrawn. Every game returns 97% of stakes over the long run, so expect to lose about 3% of what you bet.</p>
-          <p className="muted">{SINGLE ? SINGLE.name + ' · part of the Gold Fever Crash Collection' : 'Gold Fever Crash Collection · ' + CG.scenes.length + ' games'} · build 4</p>
-        </div>
-      </footer>
+      {!scene && (
+        <footer className="foot">
+          <div className="shell foot-inner">
+            <p>Demo credits have no cash value and can't be bought or withdrawn. Every game returns 97% of stakes over the long run, so expect to lose about 3% of what you bet.</p>
+            <p className="muted">{'Gold Fever Crash Collection · ' + CG.scenes.length + ' games'} · build 4</p>
+          </div>
+        </footer>
+      )}
 
-      <div className="toast" role="status" hidden={!toastMsg}>{toastMsg}</div>
+      {!scene && <div className="toast" role="status" hidden={!toastMsg}>{toastMsg}</div>}
     </div>
   );
 }

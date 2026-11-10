@@ -258,7 +258,7 @@ export class GameController {
   private placeBet(i: number, auto = false): boolean {
     const a = r2(this.settings()[i].bet);
     if (!(a >= 1)) { this.toast('The minimum bet is 1.00 credit.'); return false; }
-    if (!this.wallet.stake(a)) { this.toast(auto ? 'Auto bet ' + (i + 1) + ' stopped: not enough credits.' : 'Not enough credits for that bet. Lower it or reset your demo credits.'); return false; }
+    if (!this.wallet.stake(a)) { this.toast(auto ? 'Auto bet ' + 'AB'[i] + ' stopped: not enough credits.' : 'Not enough credits for that bet. Lower it or reset your demo credits.'); return false; }
     this.slots[i] = { status: 'placed', amount: a, queued: false };
     this.onEvent({ type: 'bet', slot: i });
     return true;
@@ -447,7 +447,7 @@ export class GameController {
       const me = this.route, other: RouteKey = me === 'L' ? 'R' : 'L';
       return sc.routes[me].name + ' at ' + x2(o[me] as number) + ' · ' + sc.routes[other].name + ' would have reached ' + x2(o[other] as number);
     }
-    return 'Round ' + this.round.nonce + ' crashed';
+    return sc.crashLines ? sc.crashLines[this.round.nonce % sc.crashLines.length] : 'Round ' + this.round.nonce + ' crashed';
   }
 
   private emit() {
@@ -455,8 +455,8 @@ export class GameController {
     const routeName = sc.routes ? sc.routes[this.route].name : '';
     let label: string, mult: string, sub: string;
     if (this.phase === 'betting') {
-      label = 'Next round in'; mult = this.countdown.toFixed(1) + 's';
-      sub = sc.dual ? 'Backing ' + routeName : sc.fork ? 'Switch at ' + x2(sc.fork) + ' · Riding ' + routeName : 'Place your bets';
+      label = 'Bets open'; mult = x2(1);
+      sub = (sc.dual ? 'Backing ' + routeName + ' · ' : sc.fork ? 'Riding ' + routeName + ' · ' : '') + 'Next round in ' + this.countdown.toFixed(1) + 's';
     } else if (this.phase === 'running') {
       label = sc.gauge(this.m); mult = x2(this.m);
       if (sc.dual) sub = 'Backing ' + routeName;

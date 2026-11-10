@@ -20,7 +20,9 @@ npm run typecheck
 
 | Path | What it does |
 | --- | --- |
-| `src/scenes/nitro-rush.js` | The Nitro Rush scene: artwork, animation, crash and cash-out effects |
+| `src/scenes/nitro-rush.js` | The Nitro Rush scene: perspective road, traffic, nitro flames, crash and cash-out effects |
+| `src/scenes/nitro-rush-car.js` | The hero car and rival cars, painted once into cached sprites |
+| `src/scenes/nitro-rush-world.js` | The three zones of the drive: skies, skylines, road surfaces and roadside props |
 | `src/scenes/index.js` | Registers the scene (add more imports here to bundle more games) |
 | `src/engine/core.js` | Shared drawing utilities, particles and the verifiable outcome generator |
 | `src/engine/art.js` | Art toolkit: textures, sprites, clouds, lighting, grain, characters |
